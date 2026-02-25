@@ -230,7 +230,7 @@ pub const Layer = struct {
     }
 
     /// Insert `sep` / `right` into interior node `n` (which has room).
-    fn interiorInsert(_: *Layer, n: *InteriorNode, sep: u64, right: NodeRef) void {
+    fn interiorInsert(n: *InteriorNode, sep: u64, right: NodeRef) void {
         var pos: usize = n.nkeys;
         while (pos > 0 and n.seps[pos - 1] > sep) : (pos -= 1) {
             n.seps[pos] = n.seps[pos - 1];
