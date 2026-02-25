@@ -100,18 +100,58 @@ Committed as part of the Phase 3 work. 102/102 tests passing (17 range tests).
 - Entry keys are slices into the iterator's internal buffer, valid until next `next()` call.
 - Layer descent: forward goes to leftmost leaf, reverse goes to rightmost leaf.
 
-## Phase 4 — Concurrency (~2,500 lines)
+## Phase 4 — Concurrency (~1,200 lines) ✅
 
-Convert all data structures to concurrent versions.
+Committed as `e720dea`. 114/114 tests passing (106 single-threaded + 8 concurrent).
 
-| Component | Description |
-|-----------|-------------|
-| Atomic fields | `@atomicLoad`/`@atomicStore` on ikey, keylenx, values, pointers |
-| `AtomicPermuter` | CAS-based permuter (linearization point for inserts) |
-| `NodeVersion` atomics | `AtomicU32` with backoff spin-lock |
-| OCC read protocol | `stable()` → read → `has_changed()` validation |
-| Write locking | Lock → validate → mutate → unlock with hand-over-hand splits |
-| Guard-based API | All public methods take `*Guard` parameter |
+Convert all data structures to concurrent versions with lock-free readers
+and per-node locking for writers.
+
+| Component | Description | Status |
+|-----------|-------------|--------|
+| `NodeVersion` atomics | CAS spinlock, `stable()`/`has_changed()`/`has_split()` OCC primitives | ✅ |
+| `LockGuard` | `mark_insert()`/`mark_split()`/`release()` with version counter bumping | ✅ |
+| Atomic leaf accessors | `load/store_permutation()` (u64), `load/store_next/prev/parent()` | ✅ |
+| Atomic internode accessors | `load/store_nkeys()`, `load/store_child()`, `load/store_parent()` | ✅ |
+| Tagged pointers | `config.tag_ptr/untag_ptr` with `usize root_tagged` | ✅ |
+| Layer pointers | `value.init_layer/try_as_layer` for sublayer roots | ✅ |
+| OCC read protocol (`get`) | `navigate_to_leaf_occ` (atomic nkeys + `load_child`) + B-link forward on `not_found` | ✅ |
+| Write locking (`put`) | OCC nav → B-link boundary check → lock → insert/split → `propagate_split` | ✅ |
+| Write locking (`remove`) | Same OCC nav + B-link boundary pattern as `put` | ✅ |
+| Range iterators | OCC on internode nav helpers, `stable`+`has_changed` retry on leaf reads | ✅ |
+| Multi-threaded tests | 8 scenarios: disjoint/overlapping/read-write/split-stress/interleaved | ✅ |
+
+### Key design decisions for Phase 4:
+- **OCC + B-link forward**: readers navigate internodes with optimistic version
+  checks (`stable` → read → `has_changed`); on `not_found`, walk the B-link
+  next-pointer chain comparing boundaries before returning null. This handles
+  concurrent splits that complete between internode navigation and leaf access.
+- **Boundary check instead of version-based split detection** for writers:
+  after locking a leaf, compare key against the first key of `load_next()`.
+  If key ≥ boundary, release lock and advance. More robust than `has_split()`
+  checks which can miss splits that complete before the version snapshot.
+- **Root reload on retry**: `put_at_layer` and `remove_at_layer` reload
+  `root_tagged` on each OCC retry iteration for the main root case, since a
+  concurrent split may have installed a new root above the stale pointer.
+- **Atomic nkeys in OCC navigation**: `navigate_to_leaf_occ` uses `load_nkeys()`
+  and `load_child()` (both atomic) instead of direct field reads, preventing
+  torn reads on partially-updated internodes.
+- **SPLIT_UNLOCK_MASK = LOCK_BIT | SPLITTING_BIT | INSERTING_BIT (= 7)**:
+  `mark_insert()` is called before `mark_split()`, so `release()` must clear
+  all three bits. Original value of 5 (missing INSERTING_BIT) caused `stable()`
+  to spin forever on the leftover dirty bit.
+- **ROOT_BIT sync after `propagate_split`**: `mark_node_nonroot` uses
+  `@atomicRmw` directly on the version word, but `guard.locked_value` isn't
+  updated. Fixed by syncing `locked_value`'s ROOT_BIT from the actual atomic
+  value before `release()`.
+
+### Bugs found and fixed:
+1. `SPLIT_UNLOCK_MASK` missing `INSERTING_BIT` → `stable()` infinite spin
+2. `ROOT_BIT` clobber in `create_new_root` → nonroot leaf restored to root
+3. `stable()` hiding splits → use raw `@atomicLoad` for pre-lock snapshots
+4. Non-OCC internode navigation for writers → switched to `navigate_to_leaf_occ`
+5. Stale root pointer on retry → reload `root_tagged` each iteration
+6. `get()` returning null without B-link check → added forward walk on `not_found`
 
 ## Phase 5 — Epoch-Based Reclamation (~1,500 lines)
 
@@ -134,15 +174,17 @@ Convert all data structures to concurrent versions.
 
 ## Estimated Size
 
-| Phase | Zig Lines (est.) |
-|-------|-----------------|
-| Phase 1 | ~3,000 |
-| Phase 2 | ~2,500 |
-| Phase 3 | ~2,000 |
-| Phase 4 | ~2,500 |
-| Phase 5 | ~1,500 |
-| Phase 6 | ~500 |
-| **Total** | **~12,000** |
+| Phase | Zig Lines (est.) | Actual |
+|-------|-----------------|--------|
+| Phase 1 | ~3,000 | ~3,200 |
+| Phase 2 | ~2,500 | ~1,960 |
+| Phase 3 | ~2,000 | ~775 |
+| Phase 4 | ~2,500 | ~1,200 |
+| Phase 5 | ~1,500 | — |
+| Phase 6 | ~500 | — |
+| **Total** | **~12,000** | **~6,610 so far** |
+
+Current codebase: 6,610 lines in `src/`, 782 lines in `tests/`, 114/114 tests passing.
 
 (vs ~25,000 lines Rust — Zig is more concise due to comptime generics, no
 trait boilerplate, no unsafe ceremony)
