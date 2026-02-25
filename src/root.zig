@@ -1,24 +1,44 @@
 //! Public re-export module for the **masstree-zig** library.
 //!
-//! Consumers of the library only need:
+//! ## Phase 1 — Core Data Structures
 //!
-//! ```zig
-//! const masstree = @import("root.zig");   // or via build.zig module name
-//! var tree = try masstree.Masstree.init(allocator);
-//! ```
+//! This module re-exports the Phase 1 core types: keys, permuter,
+//! node version, suffix storage, values, leaf nodes, and interior nodes.
 //!
-//! All internal types are also re-exported for advanced use cases
-//! (custom iteration, node inspection, etc.).
+//! Tree-level operations (get, put, remove, range scan) will be added
+//! in Phase 2.
 
-pub const Masstree = @import("tree.zig").Masstree;
-pub const Layer = @import("layer.zig").Layer;
-pub const LeafNode = @import("leaf.zig").LeafNode;
-pub const Entry = @import("leaf.zig").Entry;
-pub const ValueOrLink = @import("leaf.zig").ValueOrLink;
-pub const InteriorNode = @import("interior.zig").InteriorNode;
-pub const ChildPtr = @import("interior.zig").ChildPtr;
+// -- Core types --
 pub const key = @import("key.zig");
 pub const config = @import("config.zig");
+
+// -- Node infrastructure --
+pub const permuter = @import("permuter.zig");
+pub const node_version = @import("node_version.zig");
+pub const suffix = @import("suffix.zig");
+pub const value = @import("value.zig");
+
+// -- Node types --
+pub const leaf = @import("leaf.zig");
+pub const interior = @import("interior.zig");
+
+// -- Convenience re-exports --
+pub const Key = key.Key;
+pub const Permuter15 = permuter.Permuter15;
+pub const NodeVersion = node_version.NodeVersion;
+pub const LockGuard = node_version.LockGuard;
+pub const SuffixBag = suffix.SuffixBag;
+pub const InternodeNode = interior.InternodeNode;
+
+/// Leaf node type parameterized over value type V.
+pub fn LeafNode(comptime V: type) type {
+    return leaf.LeafNode(V);
+}
+
+/// Leaf value type parameterized over V.
+pub fn LeafValue(comptime V: type) type {
+    return value.LeafValue(V);
+}
 
 test {
     // Pull in tests from every module so `zig build test` on root.zig

@@ -28,47 +28,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
 
     // ── External test files ─────────────────────────────────────────────
-    const ext_test_sources = [_][]const u8{
-        "tests/key_tests.zig",
-        "tests/leaf_tests.zig",
-        "tests/interior_tests.zig",
-        "tests/layer_tests.zig",
-        "tests/tree_tests.zig",
-        "tests/integration_tests.zig",
-    };
-
-    for (ext_test_sources) |src| {
-        const t = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(src),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "masstree", .module = masstree_mod },
-                },
-            }),
-        });
-        const run = b.addRunArtifact(t);
-        test_step.dependOn(&run.step);
-    }
+    // Phase 1: external test files disabled until Phase 2 tree operations
+    // are implemented. All Phase 1 tests are inline in src/ modules.
+    //
+    // TODO(Phase 2): Re-enable external test files:
+    //   tests/key_tests.zig, tests/leaf_tests.zig, tests/interior_tests.zig,
+    //   tests/layer_tests.zig, tests/tree_tests.zig, tests/integration_tests.zig
 
     // ── Benchmarks ──────────────────────────────────────────────────────
-    const bench_exe = b.addExecutable(.{
-        .name = "bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("bench/main.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-            .imports = &.{
-                .{ .name = "masstree", .module = masstree_mod },
-            },
-        }),
-    });
-    b.installArtifact(bench_exe);
-
-    const run_bench = b.addRunArtifact(bench_exe);
-    run_bench.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_bench.addArgs(args);
-    const bench_step = b.step("bench", "Run benchmarks");
-    bench_step.dependOn(&run_bench.step);
+    // Phase 1: benchmarks disabled until Phase 2 tree operations.
+    // TODO(Phase 2): Re-enable bench/main.zig
 }
