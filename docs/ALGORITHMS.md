@@ -32,31 +32,34 @@ the original byte strings.  For example:
 
 ```
 function GET(layer, key):
-    ks ← makeSlice(key, layer.depth)
+    ks ← make_slice(key, layer.depth)
 
-    leaf ← findLeaf(layer.root, ks)   // descend through interior nodes
+    leaf ← find_leaf(layer.root, ks)   // descend through interior nodes
     if leaf is null:
         return null
 
-    (idx, found) ← leaf.findPos(ks, key)
+    (idx, found) ← leaf.find_pos(ks)
     if not found:
         return null
 
     entry ← leaf.entries[idx]
     match entry.value:
-        Value(v) → return v
+        Value(v):
+            if entry.full_key == key: return v
+            else: return null          // different full key
         Link(sublayer) → return GET(sublayer, key)   // recurse
 ```
 
-### `findLeaf`
+### `find_leaf`
 
-Starting from an interior node, follow `children[findChildIdx(ks)]`
+Starting from an interior node, follow `children[find_child_idx(ks)]`
 until a leaf is reached.
 
-### `findPos` (within a leaf)
+### `find_pos` (within a leaf)
 
 Linear scan over the (small, ≤15) sorted entries.  Entries are compared
-first by `key_slice` (u64), then by `full_key` (byte-by-byte).
+by `key_slice` (u64) only.  Each key_slice has at most one entry per
+leaf; keys that share a slice are disambiguated via sublayers.
 
 **Complexity:**
 
@@ -75,14 +78,14 @@ Where L = ⌈|key|/8⌉, H = B⁺ tree height, F = FANOUT (constant 15).
 
 ```
 function PUT(layer, key, value):
-    ks ← makeSlice(key, layer.depth)
+    ks ← make_slice(key, layer.depth)
 
     if layer.root is Empty:
         create leaf with single entry (ks, key, value)
         return
 
-    leaf ← findLeaf(layer.root, ks)
-    (idx, found) ← leaf.findPos(ks, key)
+    leaf ← find_leaf(layer.root, ks)
+    (idx, found) ← leaf.find_pos(ks)
 
     if found:
         entry ← leaf.entries[idx]
@@ -100,9 +103,9 @@ function PUT(layer, key, value):
                 sub.PUT(key, value)            // RECURSE into sublayer
     else:
         if leaf is not full:
-            leaf.insertAt(idx, new_entry)
+            leaf.insert_at(idx, new_entry)
         else:
-            (splitKey, newLeaf) ← splitLeaf(leaf, idx, new_entry)
+            (splitKey, newLeaf) ← split_leaf(leaf, idx, new_entry)
             propagate splitKey upward          // may cascade
 ```
 
@@ -157,19 +160,20 @@ insert.
 
 ```
 function REMOVE(layer, key):
-    ks ← makeSlice(key, layer.depth)
+    ks ← make_slice(key, layer.depth)
 
-    leaf ← findLeaf(layer.root, ks)
+    leaf ← find_leaf(layer.root, ks)
     if leaf is null: return false
 
-    (idx, found) ← leaf.findPos(ks, key)
+    (idx, found) ← leaf.find_pos(ks)
     if not found: return false
 
     entry ← leaf.entries[idx]
     match entry.value:
         Value(_):
+            if entry.full_key != key: return false
             free(entry.full_key)
-            leaf.removeAt(idx)        // shift entries left
+            leaf.remove_at(idx)        // shift entries left
             return true
         Link(sublayer):
             return sublayer.REMOVE(key)

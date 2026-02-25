@@ -79,13 +79,13 @@ pub const Layer = struct {
     pub fn deinit(self: *Layer) void {
         switch (self.root) {
             .empty => {},
-            .leaf => |l| self.freeLeaf(l),
-            .interior => |i| self.freeInterior(i),
+            .leaf => |l| self.free_leaf(l),
+            .interior => |i| self.free_interior(i),
         }
         self.allocator.destroy(self);
     }
 
-    fn freeLeaf(self: *Layer, leaf: *LeafNode) void {
+    fn free_leaf(self: *Layer, leaf: *LeafNode) void {
         for (leaf.entries[0..leaf.n_keys]) |maybe| {
             if (maybe) |e| {
                 switch (e.val) {
@@ -98,30 +98,30 @@ pub const Layer = struct {
                 self.allocator.free(e.full_key);
             }
         }
-        self.allocator.destroy(leaf);
+        leaf.destroy(self.allocator);
     }
 
-    fn freeInterior(self: *Layer, node: *InteriorNode) void {
+    fn free_interior(self: *Layer, node: *InteriorNode) void {
         for (node.children[0 .. node.n_keys + 1]) |maybe| {
             if (maybe) |child| switch (child) {
-                .leaf => |l| self.freeLeaf(l),
-                .interior => |i| self.freeInterior(i),
+                .leaf => |l| self.free_leaf(l),
+                .interior => |i| self.free_interior(i),
             };
         }
-        self.allocator.destroy(node);
+        node.destroy(self.allocator);
     }
 
     // ── Lookup ───────────────────────────────────────────────────────
 
     /// Retrieve the value associated with `full_key`, or `null`.
     pub fn get(self: *const Layer, full_key: []const u8) ?usize {
-        const ks = key_mod.makeSlice(full_key, self.depth);
-        const leaf = self.findLeaf(ks) orelse return null;
-        const res = leaf.findPos(ks, full_key);
+        const ks = key_mod.make_slice(full_key, self.depth);
+        const leaf = self.find_leaf(ks) orelse return null;
+        const res = leaf.find_pos(ks);
         if (!res.found) return null;
-        const entry = leaf.constEntryAt(res.idx);
+        const entry = leaf.const_entry_at(res.idx);
         return switch (entry.val) {
-            .value => |v| v,
+            .value => |v| if (mem.eql(u8, entry.full_key, full_key)) v else null,
             .link => |ptr| {
                 const sub: *const Layer = @ptrCast(@alignCast(ptr));
                 return sub.get(full_key);
@@ -129,18 +129,18 @@ pub const Layer = struct {
         };
     }
 
-    fn findLeaf(self: *const Layer, ks: KeySlice) ?*LeafNode {
+    fn find_leaf(self: *const Layer, ks: KeySlice) ?*LeafNode {
         return switch (self.root) {
             .empty => null,
             .leaf => |l| l,
-            .interior => |i| descendToLeaf(i, ks),
+            .interior => |i| descend_to_leaf(i, ks),
         };
     }
 
-    fn descendToLeaf(start: *InteriorNode, ks: KeySlice) ?*LeafNode {
+    fn descend_to_leaf(start: *InteriorNode, ks: KeySlice) ?*LeafNode {
         var cur = start;
         while (true) {
-            const idx = cur.findChildIdx(ks);
+            const idx = cur.find_child_idx(ks);
             const child = cur.children[idx] orelse return null;
             switch (child) {
                 .leaf => |l| return l,
@@ -152,13 +152,16 @@ pub const Layer = struct {
     // ── Insertion ────────────────────────────────────────────────────
 
     /// Insert or update `(full_key, value)`.
-    pub fn put(self: *Layer, full_key: []const u8, value: usize) !void {
-        const ks = key_mod.makeSlice(full_key, self.depth);
+    /// Returns `true` when a new entry was created, `false` when an
+    /// existing entry was updated.
+    pub fn put(self: *Layer, full_key: []const u8, value: usize) Allocator.Error!bool {
+        var was_new: bool = true;
+        const ks = key_mod.make_slice(full_key, self.depth);
         switch (self.root) {
             .empty => {
                 const leaf = try LeafNode.create(self.allocator);
                 const kc = try self.allocator.dupe(u8, full_key);
-                leaf.insertAt(0, .{
+                leaf.insert_at(0, .{
                     .key_slice = ks,
                     .full_key = kc,
                     .val = .{ .value = value },
@@ -167,7 +170,7 @@ pub const Layer = struct {
                 self.root = .{ .leaf = leaf };
             },
             .leaf => |leaf| {
-                if (try self.insertIntoLeaf(leaf, ks, full_key, value)) |split| {
+                if (try self.insert_into_leaf(leaf, ks, full_key, value, &was_new)) |split| {
                     const nr = try InteriorNode.create(self.allocator);
                     nr.keys[0] = split.split_key;
                     nr.children[0] = .{ .leaf = leaf };
@@ -177,7 +180,7 @@ pub const Layer = struct {
                 }
             },
             .interior => |inode| {
-                if (try self.insertIntoInterior(inode, ks, full_key, value)) |split| {
+                if (try self.insert_into_interior(inode, ks, full_key, value, &was_new)) |split| {
                     const nr = try InteriorNode.create(self.allocator);
                     nr.keys[0] = split.split_key;
                     nr.children[0] = .{ .interior = inode };
@@ -187,47 +190,50 @@ pub const Layer = struct {
                 }
             },
         }
+        return was_new;
     }
 
-    fn insertIntoLeaf(
+    fn insert_into_leaf(
         self: *Layer,
         leaf: *LeafNode,
         ks: KeySlice,
         full_key: []const u8,
         value: usize,
-    ) !?SplitResult {
-        const res = leaf.findPos(ks, full_key);
+        was_new: *bool,
+    ) Allocator.Error!?SplitResult {
+        const res = leaf.find_pos(ks);
 
         if (res.found) {
-            const entry = leaf.entryAt(res.idx);
+            const entry = leaf.entry_at(res.idx);
             switch (entry.val) {
                 .value => {
                     if (mem.eql(u8, entry.full_key, full_key)) {
                         // Exact duplicate — update in place.
                         entry.val = .{ .value = value };
+                        was_new.* = false;
                         return null;
                     }
                     // Same key-slice, different full key → sublayer.
                     const sub = try Layer.create(self.allocator, self.depth + 1);
                     const old_v = entry.val.value;
                     const old_k = entry.full_key;
-                    try sub.put(old_k, old_v);
-                    try sub.put(full_key, value);
+                    _ = try sub.put(old_k, old_v);
+                    _ = try sub.put(full_key, value);
                     entry.val = .{ .link = @ptrCast(sub) };
                     return null;
                 },
                 .link => |ptr| {
                     const sub: *Layer = @ptrCast(@alignCast(ptr));
-                    try sub.put(full_key, value);
+                    was_new.* = try sub.put(full_key, value);
                     return null;
                 },
             }
         }
 
         // New entry — insert if room.
-        if (!leaf.isFull()) {
+        if (!leaf.is_full()) {
             const kc = try self.allocator.dupe(u8, full_key);
-            leaf.insertAt(res.idx, .{
+            leaf.insert_at(res.idx, .{
                 .key_slice = ks,
                 .full_key = kc,
                 .val = .{ .value = value },
@@ -237,18 +243,18 @@ pub const Layer = struct {
         }
 
         // Leaf full — split.
-        return try self.splitLeaf(leaf, res.idx, ks, full_key, value);
+        return try self.split_leaf(leaf, res.idx, ks, full_key, value);
     }
 
     /// Split `leaf` and return the promoted separator + new right node.
-    fn splitLeaf(
+    fn split_leaf(
         self: *Layer,
         leaf: *LeafNode,
         ins_pos: usize,
         ks: KeySlice,
         full_key: []const u8,
         value: usize,
-    ) !SplitResult {
+    ) Allocator.Error!SplitResult {
         const new_leaf = try LeafNode.create(self.allocator);
 
         // Maintain the doubly-linked list.
@@ -308,38 +314,39 @@ pub const Layer = struct {
         };
     }
 
-    fn insertIntoInterior(
+    fn insert_into_interior(
         self: *Layer,
         node: *InteriorNode,
         ks: KeySlice,
         full_key: []const u8,
         value: usize,
-    ) !?SplitResult {
-        const ci = node.findChildIdx(ks);
+        was_new: *bool,
+    ) Allocator.Error!?SplitResult {
+        const ci = node.find_child_idx(ks);
         const child = node.children[ci] orelse unreachable;
 
         const maybe_split: ?SplitResult = switch (child) {
-            .leaf => |l| try self.insertIntoLeaf(l, ks, full_key, value),
-            .interior => |i| try self.insertIntoInterior(i, ks, full_key, value),
+            .leaf => |l| try self.insert_into_leaf(l, ks, full_key, value, was_new),
+            .interior => |i| try self.insert_into_interior(i, ks, full_key, value, was_new),
         };
 
         const split = maybe_split orelse return null;
 
-        if (!node.isFull()) {
-            node.insertAt(ci, split.split_key, split.new_child);
+        if (!node.is_full()) {
+            node.insert_at(ci, split.split_key, split.new_child);
             return null;
         }
 
-        return try self.splitInterior(node, ci, split.split_key, split.new_child);
+        return try self.split_interior(node, ci, split.split_key, split.new_child);
     }
 
-    fn splitInterior(
+    fn split_interior(
         self: *Layer,
         node: *InteriorNode,
         ins_pos: usize,
         new_key: KeySlice,
         new_child: ChildPtr,
-    ) !SplitResult {
+    ) Allocator.Error!SplitResult {
         const new_node = try InteriorNode.create(self.allocator);
 
         // Temporary arrays: FANOUT+1 keys, FANOUT+2 children.
@@ -407,19 +414,20 @@ pub const Layer = struct {
     ///
     /// **Note:** no node merging / redistribution is performed.
     pub fn remove(self: *Layer, full_key: []const u8) bool {
-        const ks = key_mod.makeSlice(full_key, self.depth);
-        const leaf = self.findLeaf(ks) orelse return false;
-        return self.removeFromLeaf(leaf, ks, full_key);
+        const ks = key_mod.make_slice(full_key, self.depth);
+        const leaf = self.find_leaf(ks) orelse return false;
+        return self.remove_from_leaf(leaf, ks, full_key);
     }
 
-    fn removeFromLeaf(self: *Layer, leaf: *LeafNode, ks: KeySlice, full_key: []const u8) bool {
-        const res = leaf.findPos(ks, full_key);
+    fn remove_from_leaf(self: *Layer, leaf: *LeafNode, ks: KeySlice, full_key: []const u8) bool {
+        const res = leaf.find_pos(ks);
         if (!res.found) return false;
-        const entry = leaf.constEntryAt(res.idx);
+        const entry = leaf.const_entry_at(res.idx);
         switch (entry.val) {
             .value => {
+                if (!mem.eql(u8, entry.full_key, full_key)) return false;
                 self.allocator.free(entry.full_key);
-                _ = leaf.removeAt(res.idx);
+                _ = leaf.remove_at(res.idx);
                 return true;
             },
             .link => |ptr| {
@@ -440,7 +448,7 @@ pub const Layer = struct {
         pub fn next(self: *Iterator) ?Entry {
             while (self.current_leaf) |leaf| {
                 if (self.current_idx < leaf.n_keys) {
-                    const e = leaf.constEntryAt(self.current_idx);
+                    const e = leaf.const_entry_at(self.current_idx);
                     self.current_idx += 1;
                     return e;
                 }
@@ -454,12 +462,12 @@ pub const Layer = struct {
     /// Create an iterator starting from the leftmost leaf.
     pub fn iterator(self: *const Layer) Iterator {
         return .{
-            .current_leaf = self.findLeftmostLeaf(),
+            .current_leaf = self.find_leftmost_leaf(),
             .current_idx = 0,
         };
     }
 
-    fn findLeftmostLeaf(self: *const Layer) ?*LeafNode {
+    fn find_leftmost_leaf(self: *const Layer) ?*LeafNode {
         return switch (self.root) {
             .empty => null,
             .leaf => |l| l,
@@ -482,7 +490,7 @@ test "Layer: put and get single entry" {
     var layer = try Layer.create(testing.allocator, 0);
     defer layer.deinit();
 
-    try layer.put("hello", 42);
+    _ = try layer.put("hello", 42);
     try testing.expectEqual(@as(?usize, 42), layer.get("hello"));
 }
 
@@ -496,8 +504,8 @@ test "Layer: update in place" {
     var layer = try Layer.create(testing.allocator, 0);
     defer layer.deinit();
 
-    try layer.put("k", 1);
-    try layer.put("k", 2);
+    _ = try layer.put("k", 1);
+    _ = try layer.put("k", 2);
     try testing.expectEqual(@as(?usize, 2), layer.get("k"));
 }
 
@@ -505,7 +513,7 @@ test "Layer: remove" {
     var layer = try Layer.create(testing.allocator, 0);
     defer layer.deinit();
 
-    try layer.put("k", 1);
+    _ = try layer.put("k", 1);
     try testing.expect(layer.remove("k"));
     try testing.expectEqual(@as(?usize, null), layer.get("k"));
     try testing.expect(!layer.remove("k"));
@@ -518,7 +526,7 @@ test "Layer: split triggered by FANOUT+1 inserts" {
     for (0..FANOUT + 1) |i| {
         var buf: [32]u8 = undefined;
         const k = std.fmt.bufPrint(&buf, "key_{d:0>4}", .{i}) catch unreachable;
-        try layer.put(k, i);
+        _ = try layer.put(k, i);
     }
     for (0..FANOUT + 1) |i| {
         var buf: [32]u8 = undefined;
@@ -531,8 +539,8 @@ test "Layer: sublayer creation for colliding key slices" {
     var layer = try Layer.create(testing.allocator, 0);
     defer layer.deinit();
 
-    try layer.put("abcdefghXXX", 1);
-    try layer.put("abcdefghYYY", 2);
+    _ = try layer.put("abcdefghXXX", 1);
+    _ = try layer.put("abcdefghYYY", 2);
     try testing.expectEqual(@as(?usize, 1), layer.get("abcdefghXXX"));
     try testing.expectEqual(@as(?usize, 2), layer.get("abcdefghYYY"));
 }

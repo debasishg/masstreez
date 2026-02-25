@@ -6,11 +6,11 @@
 //! milliseconds and throughput (ops/sec).
 
 const std = @import("std");
-const Masstree = @import("../src/tree.zig").Masstree;
+const Masstree = @import("masstree").Masstree;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn fmtKey(buf: []u8, prefix: []const u8, i: usize) []u8 {
+fn fmt_key(buf: []u8, prefix: []const u8, i: usize) []u8 {
     return std.fmt.bufPrint(buf, "{s}{d:0>10}", .{ prefix, i }) catch unreachable;
 }
 
@@ -28,7 +28,7 @@ fn benchSeqInsert(a: std.mem.Allocator, n: usize) !u64 {
     var timer = try std.time.Timer.start();
     for (0..n) |i| {
         var buf: [64]u8 = undefined;
-        try t.put(fmtKey(&buf, "si_", i), i);
+        try t.put(fmt_key(&buf, "si_", i), i);
     }
     return timer.read();
 }
@@ -38,12 +38,12 @@ fn benchSeqGet(a: std.mem.Allocator, n: usize) !u64 {
     defer t.deinit();
     for (0..n) |i| {
         var buf: [64]u8 = undefined;
-        try t.put(fmtKey(&buf, "sg_", i), i);
+        try t.put(fmt_key(&buf, "sg_", i), i);
     }
     var timer = try std.time.Timer.start();
     for (0..n) |i| {
         var buf: [64]u8 = undefined;
-        std.mem.doNotOptimizeAway(t.get(fmtKey(&buf, "sg_", i)));
+        std.mem.doNotOptimizeAway(t.get(fmt_key(&buf, "sg_", i)));
     }
     return timer.read();
 }
@@ -53,12 +53,12 @@ fn benchSeqDelete(a: std.mem.Allocator, n: usize) !u64 {
     defer t.deinit();
     for (0..n) |i| {
         var buf: [64]u8 = undefined;
-        try t.put(fmtKey(&buf, "sd_", i), i);
+        try t.put(fmt_key(&buf, "sd_", i), i);
     }
     var timer = try std.time.Timer.start();
     for (0..n) |i| {
         var buf: [64]u8 = undefined;
-        std.mem.doNotOptimizeAway(t.remove(fmtKey(&buf, "sd_", i)));
+        std.mem.doNotOptimizeAway(t.remove(fmt_key(&buf, "sd_", i)));
     }
     return timer.read();
 }
@@ -112,13 +112,13 @@ fn benchMixed(a: std.mem.Allocator, n: usize) !u64 {
     defer t.deinit();
     for (0..n / 2) |i| {
         var buf: [64]u8 = undefined;
-        try t.put(fmtKey(&buf, "mx_", i), i);
+        try t.put(fmt_key(&buf, "mx_", i), i);
     }
 
     var timer = try std.time.Timer.start();
     for (0..n) |i| {
         var buf: [64]u8 = undefined;
-        const k = fmtKey(&buf, "mx_", i);
+        const k = fmt_key(&buf, "mx_", i);
         switch (i % 3) {
             0 => try t.put(k, i),
             1 => std.mem.doNotOptimizeAway(t.get(k)),

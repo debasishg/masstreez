@@ -64,19 +64,23 @@ pub const LeafNode = struct {
         return node;
     }
 
-    /// Find the position for `(ks, full_key)` within this leaf.
+    /// Return this node's memory to the allocator.
+    pub fn destroy(self: *LeafNode, allocator: mem.Allocator) void {
+        allocator.destroy(self);
+    }
+
+    /// Find the position for `ks` within this leaf.
     ///
     /// Returns an `(idx, found)` pair:
-    /// * If `found` is `true`, `idx` is the index of the matching entry.
+    /// * If `found` is `true`, `idx` is the index of the entry whose
+    ///   `key_slice` equals `ks`.
     /// * Otherwise `idx` is the insertion point that preserves sort order.
-    pub fn findPos(self: *const LeafNode, ks: KeySlice, full_key: []const u8) struct { idx: usize, found: bool } {
+    pub fn find_pos(self: *const LeafNode, ks: KeySlice) struct { idx: usize, found: bool } {
         var i: usize = 0;
         while (i < self.n_keys) : (i += 1) {
             const e = self.entries[i].?;
             if (e.key_slice == ks) {
-                const ord = mem.order(u8, e.full_key, full_key);
-                if (ord == .eq) return .{ .idx = i, .found = true };
-                if (ord == .gt) return .{ .idx = i, .found = false };
+                return .{ .idx = i, .found = true };
             } else if (e.key_slice > ks) {
                 return .{ .idx = i, .found = false };
             }
@@ -87,7 +91,7 @@ pub const LeafNode = struct {
     /// Insert `entry` at position `pos`, shifting later entries right.
     ///
     /// **Precondition:** the node must not be full.
-    pub fn insertAt(self: *LeafNode, pos: usize, entry: Entry) void {
+    pub fn insert_at(self: *LeafNode, pos: usize, entry: Entry) void {
         std.debug.assert(self.n_keys < config.FANOUT);
         var i: usize = self.n_keys;
         while (i > pos) : (i -= 1) {
@@ -98,7 +102,7 @@ pub const LeafNode = struct {
     }
 
     /// Remove and return the entry at `pos`, shifting later entries left.
-    pub fn removeAt(self: *LeafNode, pos: usize) Entry {
+    pub fn remove_at(self: *LeafNode, pos: usize) Entry {
         std.debug.assert(pos < self.n_keys);
         const entry = self.entries[pos].?;
         var i: usize = pos;
@@ -111,17 +115,17 @@ pub const LeafNode = struct {
     }
 
     /// `true` when no more entries can be added without splitting.
-    pub fn isFull(self: *const LeafNode) bool {
+    pub fn is_full(self: *const LeafNode) bool {
         return self.n_keys >= config.FANOUT;
     }
 
     /// Mutable reference to the entry at `pos`.
-    pub fn entryAt(self: *LeafNode, pos: usize) *Entry {
+    pub fn entry_at(self: *LeafNode, pos: usize) *Entry {
         return &self.entries[pos].?;
     }
 
     /// Value (copy) of the entry at `pos`.
-    pub fn constEntryAt(self: *const LeafNode, pos: usize) Entry {
+    pub fn const_entry_at(self: *const LeafNode, pos: usize) Entry {
         return self.entries[pos].?;
     }
 };
@@ -130,48 +134,48 @@ pub const LeafNode = struct {
 
 const testing = std.testing;
 
-test "LeafNode: insertAt and findPos" {
+test "LeafNode: insert_at and find_pos" {
     var node = LeafNode{};
-    node.insertAt(0, .{ .key_slice = 100, .full_key = "aaa", .val = .{ .value = 1 }, .key_len = 3 });
-    node.insertAt(1, .{ .key_slice = 200, .full_key = "bbb", .val = .{ .value = 2 }, .key_len = 3 });
-    node.insertAt(2, .{ .key_slice = 300, .full_key = "ccc", .val = .{ .value = 3 }, .key_len = 3 });
+    node.insert_at(0, .{ .key_slice = 100, .full_key = "aaa", .val = .{ .value = 1 }, .key_len = 3 });
+    node.insert_at(1, .{ .key_slice = 200, .full_key = "bbb", .val = .{ .value = 2 }, .key_len = 3 });
+    node.insert_at(2, .{ .key_slice = 300, .full_key = "ccc", .val = .{ .value = 3 }, .key_len = 3 });
     try testing.expectEqual(@as(usize, 3), node.n_keys);
 
-    const r1 = node.findPos(200, "bbb");
+    const r1 = node.find_pos(200);
     try testing.expect(r1.found);
     try testing.expectEqual(@as(usize, 1), r1.idx);
 
-    const r2 = node.findPos(150, "xxx");
+    const r2 = node.find_pos(150);
     try testing.expect(!r2.found);
     try testing.expectEqual(@as(usize, 1), r2.idx);
 
-    const r3 = node.findPos(400, "zzz");
+    const r3 = node.find_pos(400);
     try testing.expect(!r3.found);
     try testing.expectEqual(@as(usize, 3), r3.idx);
 }
 
-test "LeafNode: removeAt" {
+test "LeafNode: remove_at" {
     var node = LeafNode{};
-    node.insertAt(0, .{ .key_slice = 10, .full_key = "a", .val = .{ .value = 1 }, .key_len = 1 });
-    node.insertAt(1, .{ .key_slice = 20, .full_key = "b", .val = .{ .value = 2 }, .key_len = 1 });
-    node.insertAt(2, .{ .key_slice = 30, .full_key = "c", .val = .{ .value = 3 }, .key_len = 1 });
+    node.insert_at(0, .{ .key_slice = 10, .full_key = "a", .val = .{ .value = 1 }, .key_len = 1 });
+    node.insert_at(1, .{ .key_slice = 20, .full_key = "b", .val = .{ .value = 2 }, .key_len = 1 });
+    node.insert_at(2, .{ .key_slice = 30, .full_key = "c", .val = .{ .value = 3 }, .key_len = 1 });
 
-    const removed = node.removeAt(1);
+    const removed = node.remove_at(1);
     try testing.expectEqual(@as(usize, 20), removed.key_slice);
     try testing.expectEqual(@as(usize, 2), node.n_keys);
-    try testing.expectEqual(@as(usize, 30), node.constEntryAt(1).key_slice);
+    try testing.expectEqual(@as(usize, 30), node.const_entry_at(1).key_slice);
 }
 
-test "LeafNode: isFull" {
+test "LeafNode: is_full" {
     var node = LeafNode{};
     for (0..config.FANOUT) |i| {
-        try testing.expect(!node.isFull());
-        node.insertAt(i, .{
+        try testing.expect(!node.is_full());
+        node.insert_at(i, .{
             .key_slice = @as(KeySlice, @intCast(i)),
             .full_key = "x",
             .val = .{ .value = i },
             .key_len = 1,
         });
     }
-    try testing.expect(node.isFull());
+    try testing.expect(node.is_full());
 }

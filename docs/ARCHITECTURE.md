@@ -26,7 +26,7 @@ This design gives Masstree two fundamental advantages:
 ```
 src/
 ├── config.zig      Compile-time constants (FANOUT, KEY_SLICE_LEN)
-├── key.zig         Pure functions: makeSlice, suffix, sliceCount
+├── key.zig         Pure functions: make_slice, suffix, slice_count
 ├── leaf.zig        LeafNode — B⁺ tree leaf with sorted entries
 ├── interior.zig    InteriorNode — B⁺ tree branch with separator keys
 ├── layer.zig       Layer — one complete B⁺ tree at a trie depth
@@ -55,11 +55,11 @@ Compile-time constants:
 
 Pure, allocation-free functions for key manipulation:
 
-- **`makeSlice(key, depth) → u64`** — extracts 8 bytes at a given trie
+- **`make_slice(key, depth) → u64`** — extracts 8 bytes at a given trie
   depth, zero-pads short keys, encodes as big-endian `u64`.
 - **`suffix(key, depth) → []const u8`** — returns the tail beyond the
   given depth.
-- **`sliceCount(key) → usize`** — `⌈len / 8⌉`.
+- **`slice_count(key) → usize`** — `⌈len / 8⌉`.
 
 ### `leaf.zig`
 
@@ -84,7 +84,7 @@ B⁺ tree interior (branch) node.  Up to `FANOUT` separator keys and
 One trie level — owns a B⁺ tree root and all its nodes.  Operations:
 
 - `get(key) → ?usize`
-- `put(key, value) → !void` (with recursive splitting)
+- `put(key, value) → !bool` (returns true if new; with recursive splitting)
 - `remove(key) → bool`
 - `iterator() → Iterator`
 

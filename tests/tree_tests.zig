@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const testing = std.testing;
-const Masstree = @import("../src/tree.zig").Masstree;
+const Masstree = @import("masstree").Masstree;
 
 // ── empty tree ───────────────────────────────────────────────────────────────
 
@@ -10,7 +10,7 @@ test "empty tree returns null / false for everything" {
     var t = try Masstree.init(testing.allocator);
     defer t.deinit();
 
-    try testing.expect(t.isEmpty());
+    try testing.expect(t.is_empty());
     try testing.expectEqual(@as(usize, 0), t.len());
     try testing.expectEqual(@as(?usize, null), t.get("x"));
     try testing.expect(!t.remove("x"));
@@ -31,7 +31,7 @@ test "insert, update, delete single key" {
     try testing.expectEqual(@as(usize, 1), t.len());
 
     try testing.expect(t.remove("key"));
-    try testing.expect(t.isEmpty());
+    try testing.expect(t.is_empty());
 }
 
 // ── multiple keys ────────────────────────────────────────────────────────────

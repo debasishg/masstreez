@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const testing = std.testing;
-const Masstree = @import("../src/tree.zig").Masstree;
+const Masstree = @import("masstree").Masstree;
 
 // ── stress: 500 keys with mixed ops ──────────────────────────────────────────
 
@@ -166,7 +166,7 @@ test "empty string as key" {
     try testing.expectEqual(@as(?usize, 0), t.get(""));
     try testing.expectEqual(@as(usize, 1), t.len());
     try testing.expect(t.remove(""));
-    try testing.expect(t.isEmpty());
+    try testing.expect(t.is_empty());
 }
 
 // ── keys with common 8-byte prefix then diverge ─────────────────────────────

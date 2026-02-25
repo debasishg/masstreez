@@ -51,10 +51,9 @@ pub const Masstree = struct {
     /// * If `key` already exists its value is overwritten and the entry
     ///   count does not change.
     /// * Otherwise a new entry is created and the count increments.
-    pub fn put(self: *Masstree, key: []const u8, value: usize) !void {
-        const existed = self.root_layer.get(key) != null;
-        try self.root_layer.put(key, value);
-        if (!existed) self.count += 1;
+    pub fn put(self: *Masstree, key: []const u8, value: usize) Allocator.Error!void {
+        const was_new = try self.root_layer.put(key, value);
+        if (was_new) self.count += 1;
     }
 
     /// Look up `key`.  Returns `null` when the key is absent.
@@ -75,7 +74,7 @@ pub const Masstree = struct {
     }
 
     /// `true` when the tree holds zero entries.
-    pub fn isEmpty(self: *const Masstree) bool {
+    pub fn is_empty(self: *const Masstree) bool {
         return self.count == 0;
     }
 };
@@ -99,5 +98,5 @@ test "Masstree: basic CRUD" {
     try testing.expect(t.remove("a"));
     try testing.expectEqual(@as(?usize, null), t.get("a"));
     try testing.expectEqual(@as(usize, 0), t.len());
-    try testing.expect(t.isEmpty());
+    try testing.expect(t.is_empty());
 }

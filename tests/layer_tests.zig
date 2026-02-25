@@ -2,8 +2,9 @@
 
 const std = @import("std");
 const testing = std.testing;
-const Layer = @import("../src/layer.zig").Layer;
-const config = @import("../src/config.zig");
+const masstree = @import("masstree");
+const Layer = masstree.Layer;
+const config = masstree.config;
 
 // ── bulk insert / lookup ─────────────────────────────────────────────────────
 
@@ -15,7 +16,7 @@ test "200 inserts and lookups" {
     for (0..n) |i| {
         var buf: [32]u8 = undefined;
         const k = std.fmt.bufPrint(&buf, "key_{d:0>6}", .{i}) catch unreachable;
-        try layer.put(k, i);
+        _ = try layer.put(k, i);
     }
     for (0..n) |i| {
         var buf: [32]u8 = undefined;
@@ -33,7 +34,7 @@ test "insert then remove odd keys" {
     for (0..50) |i| {
         var buf: [32]u8 = undefined;
         const k = std.fmt.bufPrint(&buf, "lr_{d:0>4}", .{i}) catch unreachable;
-        try layer.put(k, i);
+        _ = try layer.put(k, i);
     }
 
     for (0..50) |i| {
@@ -65,7 +66,7 @@ test "20 keys sharing an 8-byte prefix" {
     for (0..20) |i| {
         var buf: [32]u8 = undefined;
         const k = std.fmt.bufPrint(&buf, "{s}{d:0>4}", .{ prefix, i }) catch unreachable;
-        try layer.put(k, i * 100);
+        _ = try layer.put(k, i * 100);
     }
     for (0..20) |i| {
         var buf: [32]u8 = undefined;
@@ -84,7 +85,7 @@ test "iterator walks leaves in sorted order" {
     for (0..n) |i| {
         var buf: [32]u8 = undefined;
         const k = std.fmt.bufPrint(&buf, "it_{d:0>4}", .{i}) catch unreachable;
-        try layer.put(k, i);
+        _ = try layer.put(k, i);
     }
 
     var it = layer.iterator();
@@ -107,5 +108,5 @@ test "iterator on empty layer" {
     defer layer.deinit();
 
     var it = layer.iterator();
-    try testing.expectEqual(@as(?@import("../src/leaf.zig").Entry, null), it.next());
+    try testing.expectEqual(@as(?@import("masstree").Entry, null), it.next());
 }
