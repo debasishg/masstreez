@@ -34,6 +34,7 @@ const value_mod = @import("value.zig");
 const perm_mod = @import("permuter.zig");
 const Permuter15 = perm_mod.Permuter15;
 const config = @import("config.zig");
+const range_mod = @import("range.zig");
 
 // ============================================================================
 //  InsertSearchResult
@@ -106,6 +107,41 @@ pub fn MassTree(comptime V: type) type {
         /// Check if the tree is empty.
         pub fn is_empty(self: *const Self) bool {
             return self.count == 0;
+        }
+
+        // ====================================================================
+        //  Range Iteration
+        // ====================================================================
+
+        /// Range bound specification (re-exported from range module).
+        pub const RangeBound = range_mod.RangeBound;
+
+        /// Forward range iterator type.
+        pub const ForwardIterator = range_mod.RangeIterator(V);
+
+        /// Reverse range iterator type.
+        pub const ReverseIterator = range_mod.ReverseRangeIterator(V);
+
+        /// Create a forward iterator over keys in [start, end].
+        ///
+        /// ```zig
+        /// var it = tree.range(.{ .included = "aaa" }, .{ .excluded = "zzz" });
+        /// while (it.next()) |entry| {
+        ///     // entry.key, entry.value
+        /// }
+        /// ```
+        pub fn range(self: *const Self, start: RangeBound, end: RangeBound) ForwardIterator {
+            return ForwardIterator.init(self.root, self.root_is_leaf, start, end);
+        }
+
+        /// Create a reverse iterator over keys in [start, end] (descending order).
+        pub fn range_reverse(self: *const Self, start: RangeBound, end: RangeBound) ReverseIterator {
+            return ReverseIterator.init(self.root, self.root_is_leaf, start, end);
+        }
+
+        /// Create a forward iterator over all keys.
+        pub fn range_all(self: *const Self) ForwardIterator {
+            return self.range(.{ .unbounded = {} }, .{ .unbounded = {} });
         }
 
         // ====================================================================
@@ -404,7 +440,13 @@ pub fn MassTree(comptime V: type) type {
             errdefer right.deinit(self.allocator);
 
             const result = try leaf.split_and_insert(
-                sp.pos, right, logical_pos, ik, klx, LV.init_value(val), suf,
+                sp.pos,
+                right,
+                logical_pos,
+                ik,
+                klx,
+                LV.init_value(val),
+                suf,
             );
             _ = result;
 
@@ -462,7 +504,11 @@ pub fn MassTree(comptime V: type) type {
                 const new_sibling = try InternodeNode.init_for_split(self.allocator, parent.height);
                 const child_idx = parent.find_child_index(left) orelse 0;
                 const split_result = parent.split_into(
-                    new_sibling, @ptrCast(new_sibling), child_idx, s_ikey, right,
+                    new_sibling,
+                    @ptrCast(new_sibling),
+                    child_idx,
+                    s_ikey,
+                    right,
                 );
 
                 if (split_result.insert_went_left) {
@@ -1006,4 +1052,399 @@ test "MassTree: large stress 1000 keys" {
         try testing.expectEqual(i, tree.remove(&buf).?);
     }
     try testing.expectEqual(@as(usize, 0), tree.len());
+}
+
+// ============================================================================
+//  Range Iterator Tests
+// ============================================================================
+
+test "MassTree: range_all forward" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    _ = try tree.put("bbb", 2);
+    _ = try tree.put("aaa", 1);
+    _ = try tree.put("ccc", 3);
+
+    var it = tree.range_all();
+    const e1 = it.next().?;
+    try testing.expectEqualSlices(u8, "aaa", e1.key);
+    try testing.expectEqual(@as(u64, 1), e1.value);
+
+    const e2 = it.next().?;
+    try testing.expectEqualSlices(u8, "bbb", e2.key);
+    try testing.expectEqual(@as(u64, 2), e2.value);
+
+    const e3 = it.next().?;
+    try testing.expectEqualSlices(u8, "ccc", e3.key);
+    try testing.expectEqual(@as(u64, 3), e3.value);
+
+    try testing.expect(it.next() == null);
+}
+
+test "MassTree: range with included bounds" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    _ = try tree.put("aaa", 1);
+    _ = try tree.put("bbb", 2);
+    _ = try tree.put("ccc", 3);
+    _ = try tree.put("ddd", 4);
+    _ = try tree.put("eee", 5);
+
+    var it = tree.range(.{ .included = "bbb" }, .{ .included = "ddd" });
+    const e1 = it.next().?;
+    try testing.expectEqualSlices(u8, "bbb", e1.key);
+    try testing.expectEqual(@as(u64, 2), e1.value);
+
+    const e2 = it.next().?;
+    try testing.expectEqualSlices(u8, "ccc", e2.key);
+    try testing.expectEqual(@as(u64, 3), e2.value);
+
+    const e3 = it.next().?;
+    try testing.expectEqualSlices(u8, "ddd", e3.key);
+    try testing.expectEqual(@as(u64, 4), e3.value);
+
+    try testing.expect(it.next() == null);
+}
+
+test "MassTree: range with excluded bounds" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    _ = try tree.put("aaa", 1);
+    _ = try tree.put("bbb", 2);
+    _ = try tree.put("ccc", 3);
+    _ = try tree.put("ddd", 4);
+    _ = try tree.put("eee", 5);
+
+    var it = tree.range(.{ .excluded = "bbb" }, .{ .excluded = "eee" });
+    const e1 = it.next().?;
+    try testing.expectEqualSlices(u8, "ccc", e1.key);
+    try testing.expectEqual(@as(u64, 3), e1.value);
+
+    const e2 = it.next().?;
+    try testing.expectEqualSlices(u8, "ddd", e2.key);
+    try testing.expectEqual(@as(u64, 4), e2.value);
+
+    try testing.expect(it.next() == null);
+}
+
+test "MassTree: range with unbounded start" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    _ = try tree.put("aaa", 1);
+    _ = try tree.put("bbb", 2);
+    _ = try tree.put("ccc", 3);
+
+    var it = tree.range(.{ .unbounded = {} }, .{ .included = "bbb" });
+    const e1 = it.next().?;
+    try testing.expectEqualSlices(u8, "aaa", e1.key);
+
+    const e2 = it.next().?;
+    try testing.expectEqualSlices(u8, "bbb", e2.key);
+
+    try testing.expect(it.next() == null);
+}
+
+test "MassTree: range with unbounded end" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    _ = try tree.put("aaa", 1);
+    _ = try tree.put("bbb", 2);
+    _ = try tree.put("ccc", 3);
+
+    var it = tree.range(.{ .included = "bbb" }, .{ .unbounded = {} });
+    const e1 = it.next().?;
+    try testing.expectEqualSlices(u8, "bbb", e1.key);
+
+    const e2 = it.next().?;
+    try testing.expectEqualSlices(u8, "ccc", e2.key);
+
+    try testing.expect(it.next() == null);
+}
+
+test "MassTree: range empty result" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    _ = try tree.put("aaa", 1);
+    _ = try tree.put("zzz", 2);
+
+    var it = tree.range(.{ .included = "mmm" }, .{ .included = "nnn" });
+    try testing.expect(it.next() == null);
+}
+
+test "MassTree: range empty tree" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    var it = tree.range_all();
+    try testing.expect(it.next() == null);
+}
+
+test "MassTree: range with many keys across splits" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    const N: u64 = 100;
+    var i: u64 = 0;
+    while (i < N) : (i += 1) {
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, i, .big);
+        _ = try tree.put(&buf, i);
+    }
+
+    // Iterate all and check ascending order
+    var it = tree.range_all();
+    var count: usize = 0;
+    var last_key: ?u64 = null;
+    while (it.next()) |entry| {
+        const k = std.mem.readInt(u64, entry.key[0..8], .big);
+        if (last_key) |lk| {
+            try testing.expect(k > lk);
+        }
+        last_key = k;
+        count += 1;
+    }
+    try testing.expectEqual(@as(usize, @intCast(N)), count);
+}
+
+test "MassTree: range bounded subset of many keys" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    const N: u64 = 100;
+    var i: u64 = 0;
+    while (i < N) : (i += 1) {
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, i, .big);
+        _ = try tree.put(&buf, i * 10);
+    }
+
+    // Range [20, 30) — should get keys 20..29
+    var start_buf: [8]u8 = undefined;
+    var end_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &start_buf, 20, .big);
+    std.mem.writeInt(u64, &end_buf, 30, .big);
+
+    var it = tree.range(.{ .included = &start_buf }, .{ .excluded = &end_buf });
+    var count: usize = 0;
+    var expected: u64 = 20;
+    while (it.next()) |entry| {
+        const k = std.mem.readInt(u64, entry.key[0..8], .big);
+        try testing.expectEqual(expected, k);
+        try testing.expectEqual(expected * 10, entry.value);
+        expected += 1;
+        count += 1;
+    }
+    try testing.expectEqual(@as(usize, 10), count);
+}
+
+test "MassTree: range with long keys (layers)" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    _ = try tree.put("aaaaaaaa_alpha", 1);
+    _ = try tree.put("aaaaaaaa_beta", 2);
+    _ = try tree.put("aaaaaaaa_gamma", 3);
+    _ = try tree.put("bbbb", 4);
+
+    // All keys
+    var it = tree.range_all();
+    const e1 = it.next().?;
+    try testing.expectEqualSlices(u8, "aaaaaaaa_alpha", e1.key);
+    try testing.expectEqual(@as(u64, 1), e1.value);
+
+    const e2 = it.next().?;
+    try testing.expectEqualSlices(u8, "aaaaaaaa_beta", e2.key);
+    try testing.expectEqual(@as(u64, 2), e2.value);
+
+    const e3 = it.next().?;
+    try testing.expectEqualSlices(u8, "aaaaaaaa_gamma", e3.key);
+    try testing.expectEqual(@as(u64, 3), e3.value);
+
+    const e4 = it.next().?;
+    try testing.expectEqualSlices(u8, "bbbb", e4.key);
+    try testing.expectEqual(@as(u64, 4), e4.value);
+
+    try testing.expect(it.next() == null);
+}
+
+test "MassTree: range bounded within layer" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    _ = try tree.put("aaaaaaaa_alpha", 1);
+    _ = try tree.put("aaaaaaaa_beta", 2);
+    _ = try tree.put("aaaaaaaa_gamma", 3);
+
+    var it = tree.range(
+        .{ .included = "aaaaaaaa_beta" },
+        .{ .included = "aaaaaaaa_gamma" },
+    );
+    const e1 = it.next().?;
+    try testing.expectEqualSlices(u8, "aaaaaaaa_beta", e1.key);
+
+    const e2 = it.next().?;
+    try testing.expectEqualSlices(u8, "aaaaaaaa_gamma", e2.key);
+
+    try testing.expect(it.next() == null);
+}
+
+test "MassTree: reverse range_all" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    _ = try tree.put("aaa", 1);
+    _ = try tree.put("bbb", 2);
+    _ = try tree.put("ccc", 3);
+
+    var it = tree.range_reverse(.{ .unbounded = {} }, .{ .unbounded = {} });
+    const e1 = it.next().?;
+    try testing.expectEqualSlices(u8, "ccc", e1.key);
+    try testing.expectEqual(@as(u64, 3), e1.value);
+
+    const e2 = it.next().?;
+    try testing.expectEqualSlices(u8, "bbb", e2.key);
+    try testing.expectEqual(@as(u64, 2), e2.value);
+
+    const e3 = it.next().?;
+    try testing.expectEqualSlices(u8, "aaa", e3.key);
+    try testing.expectEqual(@as(u64, 1), e3.value);
+
+    try testing.expect(it.next() == null);
+}
+
+test "MassTree: reverse range with bounds" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    _ = try tree.put("aaa", 1);
+    _ = try tree.put("bbb", 2);
+    _ = try tree.put("ccc", 3);
+    _ = try tree.put("ddd", 4);
+    _ = try tree.put("eee", 5);
+
+    var it = tree.range_reverse(.{ .included = "bbb" }, .{ .included = "ddd" });
+    const e1 = it.next().?;
+    try testing.expectEqualSlices(u8, "ddd", e1.key);
+    try testing.expectEqual(@as(u64, 4), e1.value);
+
+    const e2 = it.next().?;
+    try testing.expectEqualSlices(u8, "ccc", e2.key);
+    try testing.expectEqual(@as(u64, 3), e2.value);
+
+    const e3 = it.next().?;
+    try testing.expectEqualSlices(u8, "bbb", e3.key);
+    try testing.expectEqual(@as(u64, 2), e3.value);
+
+    try testing.expect(it.next() == null);
+}
+
+test "MassTree: reverse range with layers" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    _ = try tree.put("aaaaaaaa_alpha", 1);
+    _ = try tree.put("aaaaaaaa_beta", 2);
+    _ = try tree.put("aaaaaaaa_gamma", 3);
+    _ = try tree.put("bbbb", 4);
+
+    var it = tree.range_reverse(.{ .unbounded = {} }, .{ .unbounded = {} });
+    const e1 = it.next().?;
+    try testing.expectEqualSlices(u8, "bbbb", e1.key);
+
+    const e2 = it.next().?;
+    try testing.expectEqualSlices(u8, "aaaaaaaa_gamma", e2.key);
+
+    const e3 = it.next().?;
+    try testing.expectEqualSlices(u8, "aaaaaaaa_beta", e3.key);
+
+    const e4 = it.next().?;
+    try testing.expectEqualSlices(u8, "aaaaaaaa_alpha", e4.key);
+
+    try testing.expect(it.next() == null);
+}
+
+test "MassTree: reverse range many keys" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    const N: u64 = 100;
+    var i: u64 = 0;
+    while (i < N) : (i += 1) {
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, i, .big);
+        _ = try tree.put(&buf, i);
+    }
+
+    var it = tree.range_reverse(.{ .unbounded = {} }, .{ .unbounded = {} });
+    var count: usize = 0;
+    var last_key: ?u64 = null;
+    while (it.next()) |entry| {
+        const k = std.mem.readInt(u64, entry.key[0..8], .big);
+        if (last_key) |lk| {
+            try testing.expect(k < lk);
+        }
+        last_key = k;
+        count += 1;
+    }
+    try testing.expectEqual(@as(usize, @intCast(N)), count);
+}
+
+test "MassTree: forward and reverse yield same items" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    const N: u64 = 50;
+    var i: u64 = 0;
+    while (i < N) : (i += 1) {
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, i, .big);
+        _ = try tree.put(&buf, i);
+    }
+
+    // Collect forward keys
+    var forward_keys: [50]u64 = undefined;
+    var fwd_count: usize = 0;
+    var fwd_it = tree.range_all();
+    while (fwd_it.next()) |entry| {
+        forward_keys[fwd_count] = std.mem.readInt(u64, entry.key[0..8], .big);
+        fwd_count += 1;
+    }
+
+    // Collect reverse keys
+    var reverse_keys: [50]u64 = undefined;
+    var rev_count: usize = 0;
+    var rev_it = tree.range_reverse(.{ .unbounded = {} }, .{ .unbounded = {} });
+    while (rev_it.next()) |entry| {
+        reverse_keys[rev_count] = std.mem.readInt(u64, entry.key[0..8], .big);
+        rev_count += 1;
+    }
+
+    try testing.expectEqual(fwd_count, rev_count);
+    try testing.expectEqual(@as(usize, @intCast(N)), fwd_count);
+
+    // Forward should equal reverse reversed
+    for (0..fwd_count) |idx| {
+        try testing.expectEqual(forward_keys[idx], reverse_keys[fwd_count - 1 - idx]);
+    }
+}
+
+test "MassTree: range single key" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    _ = try tree.put("aaa", 1);
+    _ = try tree.put("bbb", 2);
+    _ = try tree.put("ccc", 3);
+
+    var it = tree.range(.{ .included = "bbb" }, .{ .included = "bbb" });
+    const e = it.next().?;
+    try testing.expectEqualSlices(u8, "bbb", e.key);
+    try testing.expectEqual(@as(u64, 2), e.value);
+    try testing.expect(it.next() == null);
 }

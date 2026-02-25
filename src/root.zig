@@ -2,6 +2,7 @@
 //!
 //! ## Phase 1 — Core Data Structures
 //! ## Phase 2 — Single-Threaded Tree Operations
+//! ## Phase 3 — Range Scan
 //!
 //! This module re-exports core types and the MassTree API.
 
@@ -21,6 +22,7 @@ pub const interior = @import("interior.zig");
 
 // -- Tree --
 pub const tree = @import("tree.zig");
+pub const range = @import("range.zig");
 
 // -- Convenience re-exports --
 pub const Key = key.Key;
@@ -44,6 +46,9 @@ pub fn LeafValue(comptime V: type) type {
 pub fn MassTree(comptime V: type) type {
     return tree.MassTree(V);
 }
+
+/// Range bound specification.
+pub const RangeBound = range.RangeBound;
 
 test {
     // Pull in tests from every module so `zig build test` on root.zig
