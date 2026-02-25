@@ -1,12 +1,9 @@
 //! Public re-export module for the **masstree-zig** library.
 //!
 //! ## Phase 1 — Core Data Structures
+//! ## Phase 2 — Single-Threaded Tree Operations
 //!
-//! This module re-exports the Phase 1 core types: keys, permuter,
-//! node version, suffix storage, values, leaf nodes, and interior nodes.
-//!
-//! Tree-level operations (get, put, remove, range scan) will be added
-//! in Phase 2.
+//! This module re-exports core types and the MassTree API.
 
 // -- Core types --
 pub const key = @import("key.zig");
@@ -21,6 +18,9 @@ pub const value = @import("value.zig");
 // -- Node types --
 pub const leaf = @import("leaf.zig");
 pub const interior = @import("interior.zig");
+
+// -- Tree --
+pub const tree = @import("tree.zig");
 
 // -- Convenience re-exports --
 pub const Key = key.Key;
@@ -38,6 +38,11 @@ pub fn LeafNode(comptime V: type) type {
 /// Leaf value type parameterized over V.
 pub fn LeafValue(comptime V: type) type {
     return value.LeafValue(V);
+}
+
+/// MassTree type parameterized over value type V.
+pub fn MassTree(comptime V: type) type {
+    return tree.MassTree(V);
 }
 
 test {

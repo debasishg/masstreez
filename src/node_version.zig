@@ -46,8 +46,8 @@ pub const NodeVersion = struct {
     pub const DIRTY_MASK: u32 = INSERTING_BIT | SPLITTING_BIT;
 
     // Version counter positions
-    pub const VINSERT_LOWBIT: u32 = 1 << 6;  // bits 6-15
-    pub const VSPLIT_LOWBIT: u32 = 1 << 16;   // bits 16-30
+    pub const VINSERT_LOWBIT: u32 = 1 << 6; // bits 6-15
+    pub const VSPLIT_LOWBIT: u32 = 1 << 16; // bits 16-30
 
     // Metadata bits (stored in upper region)
     pub const DELETED_BIT: u32 = 1 << 28;
