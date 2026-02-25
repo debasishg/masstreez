@@ -100,19 +100,20 @@ pub const InternodeNode = struct {
     //  Version / Locking
     // ========================================================================
 
-    /// Get the current version.
-    pub fn get_version(self: *const Self) NodeVersion {
-        return self.version;
-    }
-
     /// Get a stable (unlocked) version snapshot.
-    pub fn stable(self: *const Self) NodeVersion {
+    /// Returns the raw u32 version word.
+    pub fn stable(self: *const Self) u32 {
         return self.version.stable();
     }
 
     /// Check if version has changed since snapshot.
-    pub fn has_changed(self: *const Self, snapshot: NodeVersion) bool {
+    pub fn has_changed(self: *const Self, snapshot: u32) bool {
         return self.version.has_changed(snapshot);
+    }
+
+    /// Check if a split has occurred since the snapshot.
+    pub fn has_split(self: *const Self, snapshot: u32) bool {
+        return self.version.has_split(snapshot);
     }
 
     /// Lock the node.
@@ -123,6 +124,45 @@ pub const InternodeNode = struct {
     /// Try to lock the node (non-blocking).
     pub fn try_lock(self: *Self) ?LockGuard {
         return self.version.try_lock();
+    }
+
+    // ========================================================================
+    //  Atomic Field Accessors
+    // ========================================================================
+
+    /// Atomically load nkeys with Acquire ordering.
+    /// This is the linearization point for internode inserts —
+    /// a new child becomes visible when nkeys is incremented.
+    pub fn load_nkeys(self: *const Self) u8 {
+        return @atomicLoad(u8, &self.nkeys, .acquire);
+    }
+
+    /// Atomically store nkeys with Release ordering.
+    /// All prior writes to ikeys/children become visible.
+    pub fn store_nkeys(self: *Self, n: u8) void {
+        @atomicStore(u8, &self.nkeys, n, .release);
+    }
+
+    /// Atomically load a child pointer.
+    pub fn load_child(self: *const Self, i: usize) ?*anyopaque {
+        std.debug.assert(i <= WIDTH);
+        return @atomicLoad(?*anyopaque, &self.children[i], .acquire);
+    }
+
+    /// Atomically store a child pointer.
+    pub fn store_child(self: *Self, i: usize, child: ?*anyopaque) void {
+        std.debug.assert(i <= WIDTH);
+        @atomicStore(?*anyopaque, &self.children[i], child, .release);
+    }
+
+    /// Atomically load the parent pointer.
+    pub fn load_parent(self: *const Self) ?*anyopaque {
+        return @atomicLoad(?*anyopaque, &self.parent, .acquire);
+    }
+
+    /// Atomically store the parent pointer.
+    pub fn store_parent(self: *Self, ptr: ?*anyopaque) void {
+        @atomicStore(?*anyopaque, &self.parent, ptr, .release);
     }
 
     // ========================================================================
@@ -256,8 +296,10 @@ pub const InternodeNode = struct {
         self.ikeys[p] = new_ikey;
         self.children[p + 1] = new_child;
 
-        // Publish
-        self.nkeys = @intCast(n + 1);
+        // Publish: atomic nkeys store (linearization point).
+        // Release ordering ensures all prior writes to ikeys/children
+        // are visible to readers who Acquire-load nkeys.
+        self.store_nkeys(@intCast(n + 1));
     }
 
     // ========================================================================

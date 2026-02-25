@@ -146,19 +146,20 @@ pub fn LeafNode(comptime V: type) type {
         //  Version / Locking
         // ====================================================================
 
-        /// Get the current version (for OCC snapshot).
-        pub fn get_version(self: *const Self) NodeVersion {
-            return self.version;
-        }
-
         /// Get a stable (unlocked) version snapshot for OCC reads.
-        pub fn stable(self: *const Self) NodeVersion {
+        /// Returns the raw u32 version word.
+        pub fn stable(self: *const Self) u32 {
             return self.version.stable();
         }
 
         /// Check if version has changed since snapshot.
-        pub fn has_changed(self: *const Self, snapshot: NodeVersion) bool {
+        pub fn has_changed(self: *const Self, snapshot: u32) bool {
             return self.version.has_changed(snapshot);
+        }
+
+        /// Check if a split has occurred since the snapshot.
+        pub fn has_split(self: *const Self, snapshot: u32) bool {
+            return self.version.has_split(snapshot);
         }
 
         /// Lock the node for modification.
@@ -169,6 +170,55 @@ pub fn LeafNode(comptime V: type) type {
         /// Try to lock the node (non-blocking).
         pub fn try_lock(self: *Self) ?LockGuard {
             return self.version.try_lock();
+        }
+
+        // ====================================================================
+        //  Atomic Field Accessors
+        // ====================================================================
+
+        /// Atomically load the permutation with Acquire ordering.
+        /// This pairs with store_permutation (Release) to form the
+        /// linearization point for concurrent inserts.
+        pub fn load_permutation(self: *const Self) Permuter15 {
+            return .{ .value = @atomicLoad(u64, &self.permutation.value, .acquire) };
+        }
+
+        /// Atomically store the permutation with Release ordering.
+        /// This is the linearization point — all prior writes to ikeys,
+        /// keylenx, values, and suffixes become visible to readers
+        /// who subsequently load the permutation with Acquire.
+        pub fn store_permutation(self: *Self, perm: Permuter15) void {
+            @atomicStore(u64, &self.permutation.value, perm.value, .release);
+        }
+
+        /// Atomically load the next leaf pointer.
+        pub fn load_next(self: *const Self) ?*Self {
+            return @atomicLoad(?*Self, &self.next, .acquire);
+        }
+
+        /// Atomically store the next leaf pointer.
+        pub fn store_next(self: *Self, ptr: ?*Self) void {
+            @atomicStore(?*Self, &self.next, ptr, .release);
+        }
+
+        /// Atomically load the prev leaf pointer.
+        pub fn load_prev(self: *const Self) ?*Self {
+            return @atomicLoad(?*Self, &self.prev, .acquire);
+        }
+
+        /// Atomically store the prev leaf pointer.
+        pub fn store_prev(self: *Self, ptr: ?*Self) void {
+            @atomicStore(?*Self, &self.prev, ptr, .release);
+        }
+
+        /// Atomically load the parent pointer.
+        pub fn load_parent(self: *const Self) ?*anyopaque {
+            return @atomicLoad(?*anyopaque, &self.parent, .acquire);
+        }
+
+        /// Atomically store the parent pointer.
+        pub fn store_parent(self: *Self, ptr: ?*anyopaque) void {
+            @atomicStore(?*anyopaque, &self.parent, ptr, .release);
         }
 
         // ====================================================================
@@ -379,8 +429,11 @@ pub fn LeafNode(comptime V: type) type {
             // Write data to the physical slot
             try self.assign_slot(slot, ik, klx, val, suf);
 
-            // Publish: update permutation (linearization point)
-            self.permutation = perm;
+            // Publish: atomic store permutation (linearization point).
+            // Release ordering ensures all prior writes (ikeys, keylenx,
+            // values, suffix) are visible to readers who Acquire-load
+            // the permutation.
+            self.store_permutation(perm);
             return slot;
         }
 
@@ -602,14 +655,15 @@ pub fn LeafNode(comptime V: type) type {
         // ====================================================================
 
         /// Convert a value slot to a layer pointer.
-        pub fn make_layer(self: *Self, slot: usize, layer_ptr: *anyopaque) void {
+        /// `is_leaf` indicates whether the layer root is a leaf node.
+        pub fn make_layer(self: *Self, slot: usize, layer_ptr: *anyopaque, is_leaf: bool) void {
             std.debug.assert(slot < WIDTH);
-            self.values[slot] = LV.init_layer(layer_ptr);
+            self.values[slot] = LV.init_layer(layer_ptr, is_leaf);
             self.keylenx[slot] = LAYER_KEYLENX;
         }
 
-        /// Get the layer pointer at a slot.
-        pub fn get_layer(self: *const Self, slot: usize) ?*anyopaque {
+        /// Get the layer info at a slot (pointer + is_leaf flag).
+        pub fn get_layer(self: *const Self, slot: usize) ?value_mod.TaggedLayerPtr {
             if (self.keylenx[slot] >= LAYER_KEYLENX) {
                 return self.values[slot].try_as_layer();
             }
@@ -795,7 +849,7 @@ test "LeafNode: layer support" {
 
     // Convert to layer
     var dummy: u8 = 0;
-    node.make_layer(node.permutation.get(0), @ptrCast(&dummy));
+    node.make_layer(node.permutation.get(0), @ptrCast(&dummy), true);
 
     const slot = node.permutation.get(0);
     try testing.expect(node.is_layer_slot(slot));

@@ -7,8 +7,19 @@
 //!
 //! In the current single-threaded phase, values are stored directly.
 //! Phase 5 may introduce reference counting for concurrent reads.
+//!
+//! ## Layer Pointers (Phase 4)
+//!
+//! Layer pointers are stored as tagged `usize` values (low bit = is_leaf)
+//! so that the node type can be determined without casting. This fixes
+//! the sublayer root bug where a layer root becomes an internode after
+//! splits but was always assumed to be a leaf.
 
 const std = @import("std");
+const config = @import("config.zig");
+
+/// Re-export for use by leaf.zig and other modules.
+pub const TaggedLayerPtr = config.TaggedPtr;
 
 // ============================================================================
 //  LeafValue(V) — comptime-generic tagged union
@@ -26,10 +37,10 @@ pub fn LeafValue(comptime V: type) type {
         /// Slot contains a value of type V.
         value: V,
 
-        /// Slot contains a pointer to a next-layer subtree (opaque).
-        /// The concrete type is `*LeafNode(V)` but stored as opaque for
-        /// cross-module decoupling; cast at use-site.
-        layer: *anyopaque,
+        /// Slot contains a pointer to a next-layer subtree, stored as a
+        /// tagged usize (low bit = is_leaf). Use `try_as_layer()` to
+        /// extract the pointer and node-type flag.
+        layer: usize,
 
         const Self = @This();
 
@@ -44,8 +55,9 @@ pub fn LeafValue(comptime V: type) type {
         }
 
         /// Create a leaf value containing a layer pointer.
-        pub fn init_layer(ptr: *anyopaque) Self {
-            return .{ .layer = ptr };
+        /// `is_leaf` indicates whether the layer root is a leaf node.
+        pub fn init_layer(ptr: *anyopaque, is_leaf: bool) Self {
+            return .{ .layer = config.tag_ptr(ptr, is_leaf) };
         }
 
         /// Check if this slot is empty.
@@ -89,19 +101,19 @@ pub fn LeafValue(comptime V: type) type {
             };
         }
 
-        /// Get the layer pointer, or null if not a layer variant.
-        pub fn try_as_layer(self: Self) ?*anyopaque {
+        /// Get the layer pointer and node type, or null if not a layer variant.
+        pub fn try_as_layer(self: Self) ?config.TaggedPtr {
             return switch (self) {
-                .layer => |ptr| ptr,
+                .layer => |tagged| config.untag_ptr(tagged),
                 else => null,
             };
         }
 
-        /// Get the layer pointer.
+        /// Get the layer pointer and node type.
         /// Panics (safety-checked unreachable) if not a Layer variant.
-        pub fn as_layer(self: Self) *anyopaque {
+        pub fn as_layer(self: Self) config.TaggedPtr {
             return switch (self) {
-                .layer => |ptr| ptr,
+                .layer => |tagged| config.untag_ptr(tagged),
                 else => unreachable,
             };
         }
@@ -122,7 +134,10 @@ pub fn LeafValue(comptime V: type) type {
                         try writer.writeAll("LeafValue.value(...)");
                     }
                 },
-                .layer => |ptr| try writer.print("LeafValue.layer(0x{x})", .{@intFromPtr(ptr)}),
+                .layer => |tagged| {
+                    const info = config.untag_ptr(tagged);
+                    try writer.print("LeafValue.layer(0x{x}, is_leaf={})", .{ @intFromPtr(info.ptr), info.is_leaf });
+                },
             }
         }
     };
@@ -179,12 +194,15 @@ test "LeafValue: layer" {
     const LV = LeafValue(u64);
     var dummy: u64 = 0xDEAD;
     const ptr: *anyopaque = @ptrCast(&dummy);
-    const v = LV.init_layer(ptr);
+    const v = LV.init_layer(ptr, true);
     try testing.expect(!v.is_empty());
     try testing.expect(!v.is_value());
     try testing.expect(v.is_layer());
-    try testing.expectEqual(ptr, v.as_layer());
-    try testing.expectEqual(ptr, v.try_as_layer().?);
+    const info = v.as_layer();
+    try testing.expectEqual(ptr, info.ptr);
+    try testing.expect(info.is_leaf);
+    const info2 = v.try_as_layer().?;
+    try testing.expectEqual(ptr, info2.ptr);
 }
 
 test "LeafValue: try_as_value_ptr" {

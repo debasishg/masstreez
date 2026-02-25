@@ -1,8 +1,8 @@
 //! Range scan support for MassTree.
 //!
 //! Provides forward and reverse iteration over key-value pairs within
-//! a specified key range. This is the single-threaded implementation;
-//! Phase 4 will add OCC-based concurrent range scans.
+//! a specified key range, using OCC (Optimistic Concurrency Control)
+//! for safe concurrent access.
 //!
 //! ## Design
 //!
@@ -20,6 +20,14 @@
 //! to the approximate start position, a `start_active` flag causes
 //! entries before the start bound to be skipped until the first valid
 //! entry is found. The end bound is checked on every emitted entry.
+//!
+//! ## Concurrency (OCC)
+//!
+//! Navigation through internodes uses OCC: take a version snapshot,
+//! read routing keys, select child, verify version. On failure, retry.
+//! Leaf reads also use OCC: `stable()` → read → `has_changed()`.
+//! If a leaf changed during reading, the leaf is re-read from the start.
+//! Leaf traversal (next/prev pointers) uses atomic loads.
 
 const std = @import("std");
 
@@ -148,7 +156,8 @@ const CursorKey = struct {
 //  Navigation helpers
 // ============================================================================
 
-/// Navigate from a root pointer to the leftmost leaf.
+/// Navigate from a root pointer to the leftmost leaf using OCC.
+/// Returns null on validation failure (caller should retry).
 fn navigate_to_leftmost_leaf(comptime Leaf: type, root: *anyopaque, root_is_leaf: bool) ?*const Leaf {
     if (root_is_leaf) {
         return @ptrCast(@alignCast(root));
@@ -156,7 +165,9 @@ fn navigate_to_leftmost_leaf(comptime Leaf: type, root: *anyopaque, root_is_leaf
 
     var inode: *const InternodeNode = @ptrCast(@alignCast(root));
     while (true) {
+        const ver = inode.stable();
         const child = inode.children[0] orelse return null;
+        if (inode.has_changed(ver)) return null;
         if (inode.height == 0) {
             return @ptrCast(@alignCast(child));
         }
@@ -164,7 +175,8 @@ fn navigate_to_leftmost_leaf(comptime Leaf: type, root: *anyopaque, root_is_leaf
     }
 }
 
-/// Navigate from a root pointer to the rightmost leaf.
+/// Navigate from a root pointer to the rightmost leaf using OCC.
+/// Returns null on validation failure (caller should retry).
 fn navigate_to_rightmost_leaf(comptime Leaf: type, root: *anyopaque, root_is_leaf: bool) ?*const Leaf {
     if (root_is_leaf) {
         return @ptrCast(@alignCast(root));
@@ -172,8 +184,10 @@ fn navigate_to_rightmost_leaf(comptime Leaf: type, root: *anyopaque, root_is_lea
 
     var inode: *const InternodeNode = @ptrCast(@alignCast(root));
     while (true) {
+        const ver = inode.stable();
         const idx: usize = @as(usize, inode.nkeys);
         const child = inode.children[idx] orelse return null;
+        if (inode.has_changed(ver)) return null;
         if (inode.height == 0) {
             return @ptrCast(@alignCast(child));
         }
@@ -181,7 +195,8 @@ fn navigate_to_rightmost_leaf(comptime Leaf: type, root: *anyopaque, root_is_lea
     }
 }
 
-/// Navigate from a root to the leaf that would contain the given ikey.
+/// Navigate from a root to the leaf that would contain the given ikey, using OCC.
+/// Returns null on validation failure (caller should retry).
 fn navigate_to_leaf(comptime Leaf: type, root: *anyopaque, root_is_leaf: bool, search_ikey: u64) ?*const Leaf {
     if (root_is_leaf) {
         return @ptrCast(@alignCast(root));
@@ -189,8 +204,10 @@ fn navigate_to_leaf(comptime Leaf: type, root: *anyopaque, root_is_leaf: bool, s
 
     var inode: *const InternodeNode = @ptrCast(@alignCast(root));
     while (true) {
+        const ver = inode.stable();
         const child_idx = inode.upper_bound(search_ikey);
         const child = inode.get_child(child_idx) orelse return null;
+        if (inode.has_changed(ver)) return null;
         if (inode.height == 0) {
             return @ptrCast(@alignCast(child));
         }
@@ -317,6 +334,9 @@ pub fn RangeIterator(comptime V: type) type {
         }
 
         /// Get the next entry in ascending key order, or null if done.
+        ///
+        /// Uses OCC on each leaf: takes a version snapshot before reading,
+        /// verifies after. If the leaf changed, re-reads from position 0.
         pub fn next(self: *Self) ?Entry {
             while (!self.exhausted) {
                 const leaf = self.leaf orelse {
@@ -328,12 +348,20 @@ pub fn RangeIterator(comptime V: type) type {
                     continue;
                 };
 
-                const perm = leaf.permutation;
+                // Take leaf version snapshot for OCC
+                const version = leaf.stable();
+
+                const perm = leaf.load_permutation();
                 const size = perm.size();
 
                 // Exhausted this leaf — advance to sibling
                 if (self.ki >= size) {
-                    if (leaf.next) |next_leaf| {
+                    // Verify leaf before following next pointer
+                    if (leaf.has_changed(version)) {
+                        self.ki = 0;
+                        continue;
+                    }
+                    if (leaf.load_next()) |next_leaf| {
                         self.leaf = next_leaf;
                         self.ki = 0;
                     } else {
@@ -353,8 +381,13 @@ pub fn RangeIterator(comptime V: type) type {
 
                 // Layer pointer — descend into sublayer
                 if (slot_klx >= LAYER_KEYLENX) {
-                    if (leaf.values[slot].try_as_layer()) |ptr| {
-                        self.descend(leaf, slot_ikey, ptr);
+                    // Verify before acting on layer pointer
+                    if (leaf.has_changed(version)) {
+                        self.ki = 0;
+                        continue;
+                    }
+                    if (leaf.values[slot].try_as_layer()) |layer_info| {
+                        self.descend(leaf, slot_ikey, layer_info.ptr, layer_info.is_leaf);
                     }
                     continue;
                 }
@@ -366,6 +399,12 @@ pub fn RangeIterator(comptime V: type) type {
                     null;
 
                 const key = self.cursor.build_key(&self.key_buf, slot_ikey, slot_klx, suf);
+
+                // Verify leaf OCC before using the read data
+                if (leaf.has_changed(version)) {
+                    self.ki = 0;
+                    continue;
+                }
 
                 // Check start bound (skip entries before start)
                 if (self.start_active) {
@@ -387,7 +426,7 @@ pub fn RangeIterator(comptime V: type) type {
         }
 
         /// Descend into a sublayer.
-        fn descend(self: *Self, parent_leaf: *const Leaf, layer_ikey: u64, layer_root: *anyopaque) void {
+        fn descend(self: *Self, parent_leaf: *const Leaf, layer_ikey: u64, layer_root: *anyopaque, layer_is_leaf: bool) void {
             // Save current context
             self.stack[self.stack_depth] = .{
                 .leaf = parent_leaf,
@@ -399,7 +438,7 @@ pub fn RangeIterator(comptime V: type) type {
             self.cursor.shift(layer_ikey);
 
             // Navigate to leftmost leaf in sublayer
-            self.leaf = navigate_to_leftmost_leaf(Leaf, layer_root, true);
+            self.leaf = navigate_to_leftmost_leaf(Leaf, layer_root, layer_is_leaf);
             self.ki = 0;
         }
 
@@ -510,7 +549,7 @@ pub fn ReverseRangeIterator(comptime V: type) type {
                 .unbounded => {
                     const leaf = navigate_to_rightmost_leaf(Leaf, root, root_is_leaf);
                     self.leaf = leaf;
-                    self.ki = if (leaf) |l| l.permutation.size() else 0;
+                    self.ki = if (leaf) |l| l.load_permutation().size() else 0;
                     self.end_active = false;
                 },
                 .included => |bound| {
@@ -536,10 +575,13 @@ pub fn ReverseRangeIterator(comptime V: type) type {
             self.leaf = leaf;
             // Start from the end of the leaf and let end_active skip
             // entries past the end bound.
-            self.ki = leaf.permutation.size();
+            self.ki = leaf.load_permutation().size();
         }
 
         /// Get the next entry in descending key order, or null if done.
+        ///
+        /// Uses OCC on each leaf: takes a version snapshot before reading,
+        /// verifies after. If the leaf changed, re-reads from the end.
         pub fn next(self: *Self) ?Entry {
             while (!self.exhausted) {
                 const leaf = self.leaf orelse {
@@ -551,11 +593,20 @@ pub fn ReverseRangeIterator(comptime V: type) type {
                     continue;
                 };
 
+                // Take leaf version snapshot for OCC
+                const version = leaf.stable();
+
                 // Exhausted this leaf backward — retreat to prev sibling
                 if (self.ki == 0) {
-                    if (leaf.prev) |prev_leaf| {
+                    // Verify leaf before following prev pointer
+                    if (leaf.has_changed(version)) {
+                        const perm = leaf.load_permutation();
+                        self.ki = perm.size();
+                        continue;
+                    }
+                    if (leaf.load_prev()) |prev_leaf| {
                         self.leaf = prev_leaf;
-                        self.ki = prev_leaf.permutation.size();
+                        self.ki = prev_leaf.load_permutation().size();
                     } else {
                         self.leaf = null;
                     }
@@ -563,7 +614,7 @@ pub fn ReverseRangeIterator(comptime V: type) type {
                 }
 
                 self.ki -= 1;
-                const perm = leaf.permutation;
+                const perm = leaf.load_permutation();
                 const slot = perm.get(self.ki);
 
                 const slot_ikey = leaf.ikeys[slot];
@@ -574,8 +625,14 @@ pub fn ReverseRangeIterator(comptime V: type) type {
 
                 // Layer pointer — descend into sublayer from the right
                 if (slot_klx >= LAYER_KEYLENX) {
-                    if (leaf.values[slot].try_as_layer()) |ptr| {
-                        self.descend(leaf, slot_ikey, ptr);
+                    // Verify before acting on layer pointer
+                    if (leaf.has_changed(version)) {
+                        const rperm = leaf.load_permutation();
+                        self.ki = rperm.size();
+                        continue;
+                    }
+                    if (leaf.values[slot].try_as_layer()) |layer_info| {
+                        self.descend(leaf, slot_ikey, layer_info.ptr, layer_info.is_leaf);
                     }
                     continue;
                 }
@@ -587,6 +644,13 @@ pub fn ReverseRangeIterator(comptime V: type) type {
                     null;
 
                 const key = self.cursor.build_key(&self.key_buf, slot_ikey, slot_klx, suf);
+
+                // Verify leaf OCC before using the read data
+                if (leaf.has_changed(version)) {
+                    const rperm = leaf.load_permutation();
+                    self.ki = rperm.size();
+                    continue;
+                }
 
                 // Check end bound (skip entries past the high end)
                 if (self.end_active) {
@@ -608,7 +672,7 @@ pub fn ReverseRangeIterator(comptime V: type) type {
         }
 
         /// Descend into a sublayer from the right (rightmost leaf, last position).
-        fn descend(self: *Self, parent_leaf: *const Leaf, layer_ikey: u64, layer_root: *anyopaque) void {
+        fn descend(self: *Self, parent_leaf: *const Leaf, layer_ikey: u64, layer_root: *anyopaque, layer_is_leaf: bool) void {
             // Save current context (ki has already been decremented past the layer slot)
             self.stack[self.stack_depth] = .{
                 .leaf = parent_leaf,
@@ -620,9 +684,9 @@ pub fn ReverseRangeIterator(comptime V: type) type {
             self.cursor.shift(layer_ikey);
 
             // Navigate to rightmost leaf in sublayer
-            const leaf = navigate_to_rightmost_leaf(Leaf, layer_root, true);
+            const leaf = navigate_to_rightmost_leaf(Leaf, layer_root, layer_is_leaf);
             self.leaf = leaf;
-            self.ki = if (leaf) |l| l.permutation.size() else 0;
+            self.ki = if (leaf) |l| l.load_permutation().size() else 0;
         }
 
         /// Ascend back to parent layer. Returns false if already at top.

@@ -30,6 +30,8 @@ const LAYER_KEYLENX = key_mod.LAYER_KEYLENX;
 const leaf_mod = @import("leaf.zig");
 const interior_mod = @import("interior.zig");
 const InternodeNode = interior_mod.InternodeNode;
+const ver_mod = @import("node_version.zig");
+const LockGuard = ver_mod.LockGuard;
 const value_mod = @import("value.zig");
 const perm_mod = @import("permuter.zig");
 const Permuter15 = perm_mod.Permuter15;
@@ -64,11 +66,9 @@ pub fn MassTree(comptime V: type) type {
     return struct {
         const Self = @This();
 
-        /// Opaque root pointer — either a *Leaf or *InternodeNode.
-        root: *anyopaque,
-
-        /// Whether the root is currently a leaf node.
-        root_is_leaf: bool,
+        /// Tagged root pointer — low bit stores is_leaf flag.
+        /// Use config.untag_ptr() to extract the pointer and type.
+        root_tagged: usize,
 
         /// Number of key-value pairs in the tree.
         count: usize,
@@ -84,8 +84,7 @@ pub fn MassTree(comptime V: type) type {
         pub fn init(allocator: Allocator) Allocator.Error!Self {
             const leaf = try Leaf.init(allocator, true);
             return .{
-                .root = @ptrCast(leaf),
-                .root_is_leaf = true,
+                .root_tagged = config.tag_ptr(@ptrCast(leaf), true),
                 .count = 0,
                 .allocator = allocator,
             };
@@ -93,20 +92,20 @@ pub fn MassTree(comptime V: type) type {
 
         /// Destroy the tree, freeing all nodes recursively.
         pub fn deinit(self: *Self) void {
-            self.destroy_node(self.root, self.root_is_leaf);
-            self.root = undefined;
-            self.root_is_leaf = true;
+            const tagged = config.untag_ptr(self.root_tagged);
+            self.destroy_node(tagged.ptr, tagged.is_leaf);
+            self.root_tagged = 0;
             self.count = 0;
         }
 
         /// Return the number of key-value pairs.
         pub fn len(self: *const Self) usize {
-            return self.count;
+            return @atomicLoad(usize, &self.count, .monotonic);
         }
 
         /// Check if the tree is empty.
         pub fn is_empty(self: *const Self) bool {
-            return self.count == 0;
+            return @atomicLoad(usize, &self.count, .monotonic) == 0;
         }
 
         // ====================================================================
@@ -131,12 +130,16 @@ pub fn MassTree(comptime V: type) type {
         /// }
         /// ```
         pub fn range(self: *const Self, start: RangeBound, end: RangeBound) ForwardIterator {
-            return ForwardIterator.init(self.root, self.root_is_leaf, start, end);
+            const root_tagged = @atomicLoad(usize, &self.root_tagged, .acquire);
+            const tagged = config.untag_ptr(root_tagged);
+            return ForwardIterator.init(tagged.ptr, tagged.is_leaf, start, end);
         }
 
         /// Create a reverse iterator over keys in [start, end] (descending order).
         pub fn range_reverse(self: *const Self, start: RangeBound, end: RangeBound) ReverseIterator {
-            return ReverseIterator.init(self.root, self.root_is_leaf, start, end);
+            const root_tagged = @atomicLoad(usize, &self.root_tagged, .acquire);
+            const tagged = config.untag_ptr(root_tagged);
+            return ReverseIterator.init(tagged.ptr, tagged.is_leaf, start, end);
         }
 
         /// Create a forward iterator over all keys.
@@ -145,46 +148,94 @@ pub fn MassTree(comptime V: type) type {
         }
 
         // ====================================================================
-        //  GET
+        //  GET — with OCC (Optimistic Concurrency Control)
         // ====================================================================
 
         /// Look up a key and return its value, or null if not found.
+        ///
+        /// Uses the OCC protocol: at each node, take a version snapshot,
+        /// perform reads, then verify the version hasn't changed.
+        /// If any version check fails, restart from the tree root.
         pub fn get(self: *const Self, key_bytes: []const u8) ?V {
-            var k = Key.init(key_bytes);
-            var node_ptr: *anyopaque = self.root;
-            var is_leaf = self.root_is_leaf;
+            // Full restart on any OCC validation failure
+            retry: while (true) {
+                var k = Key.init(key_bytes);
+                // Atomically load the root pointer
+                const root_tagged = @atomicLoad(usize, &self.root_tagged, .acquire);
+                const root = config.untag_ptr(root_tagged);
+                var node_ptr: *anyopaque = root.ptr;
+                var is_leaf = root.is_leaf;
 
-            // Layer loop: descend through trie layers
-            while (true) {
-                const leaf = navigate_to_leaf(node_ptr, is_leaf, &k);
-                const result = search_leaf_for_get(leaf, &k);
+                // Layer loop: descend through trie layers
+                while (true) {
+                    // OCC navigate to the target leaf
+                    var leaf = navigate_to_leaf_occ(node_ptr, is_leaf, &k) orelse
+                        continue :retry;
 
-                switch (result) {
-                    .found => |slot| return leaf.get_value(slot),
-                    .layer => |slot| {
-                        const layer_ptr = leaf.get_layer(slot) orelse return null;
-                        k.shift();
-                        node_ptr = layer_ptr;
-                        is_leaf = true; // layer roots start as leaves
-                        continue;
-                    },
-                    .not_found => return null,
+                    // B-link forward: if key is beyond this leaf, walk
+                    // the next-pointer chain to the correct leaf.
+                    forward: while (true) {
+                        // Take leaf version snapshot
+                        const version = leaf.stable();
+
+                        // Read under OCC
+                        const result = search_leaf_for_get(leaf, &k);
+
+                        // Validate: if leaf changed, restart this leaf
+                        if (leaf.has_changed(version)) continue :forward;
+
+                        // OCC passed — act on result
+                        switch (result) {
+                            .found => |slot| return leaf.get_value(slot),
+                            .layer => |slot| {
+                                const layer_info = leaf.get_layer(slot) orelse return null;
+                                k.shift();
+                                node_ptr = layer_info.ptr;
+                                is_leaf = layer_info.is_leaf;
+                                break :forward; // next layer
+                            },
+                            .not_found => {
+                                // Check B-link: key might be in successor leaf
+                                // due to concurrent split during internode navigation.
+                                const next = leaf.load_next() orelse return null;
+                                const next_perm = next.load_permutation();
+                                if (next_perm.size() > 0) {
+                                    const first_slot = next_perm.get(0);
+                                    const boundary_ikey = next.ikeys[first_slot];
+                                    if (k.ikey() >= boundary_ikey) {
+                                        leaf = next;
+                                        continue :forward;
+                                    }
+                                }
+                                return null;
+                            },
+                        }
+                    }
                 }
             }
         }
 
         // ====================================================================
-        //  PUT (insert or update)
+        //  PUT (insert or update) — with locking
         // ====================================================================
 
         /// Insert or update a key-value pair.
         /// Returns the old value if the key already existed.
         pub fn put(self: *Self, key_bytes: []const u8, val: V) Allocator.Error!?V {
             var k = Key.init(key_bytes);
-            return self.put_at_layer(&k, val, self.root, self.root_is_leaf, true);
+            const root_tagged = @atomicLoad(usize, &self.root_tagged, .acquire);
+            const root = config.untag_ptr(root_tagged);
+            return self.put_at_layer(&k, val, root.ptr, root.is_leaf, true);
         }
 
-        /// Internal recursive put, handles layer descent and split propagation.
+        /// Internal recursive put with leaf locking.
+        ///
+        /// Navigate to the target leaf, lock it, search, then mutate
+        /// while holding the lock. The lock is released before returning.
+        ///
+        /// Uses OCC navigation through internodes. After reaching a leaf,
+        /// walks the B-link next-pointer chain with boundary checks to find
+        /// the correct leaf, then locks it and performs the insert.
         fn put_at_layer(
             self: *Self,
             k: *Key,
@@ -193,58 +244,159 @@ pub fn MassTree(comptime V: type) type {
             layer_root_is_leaf: bool,
             is_main_root: bool,
         ) Allocator.Error!?V {
-            const leaf = navigate_to_leaf_mut(layer_root, layer_root_is_leaf, k);
+            while (true) {
+                // Reload root on each retry for main root: a concurrent split
+                // may have created a new root above the stale layer_root.
+                var current_root = layer_root;
+                var current_is_leaf = layer_root_is_leaf;
+                if (is_main_root) {
+                    const rt = @atomicLoad(usize, &self.root_tagged, .acquire);
+                    const rtp = config.untag_ptr(rt);
+                    current_root = rtp.ptr;
+                    current_is_leaf = rtp.is_leaf;
+                }
+
+                // OCC navigate to leaf (retries automatically on internode changes)
+                const const_leaf = navigate_to_leaf_occ(current_root, current_is_leaf, k) orelse continue;
+                var current: *Leaf = @constCast(const_leaf);
+
+                // B-link forward: lock each candidate leaf, check boundary,
+                // advance to successor if our key is beyond this leaf's range.
+                while (true) {
+                    var guard = current.lock();
+
+                    // Check if key belongs in a successor leaf
+                    if (current.load_next()) |next_leaf| {
+                        const next_perm = next_leaf.load_permutation();
+                        if (next_perm.size() > 0) {
+                            const first_slot = next_perm.get(0);
+                            const boundary_ikey = next_leaf.ikeys[first_slot];
+                            if (k.ikey() >= boundary_ikey) {
+                                guard.release();
+                                current = next_leaf;
+                                continue;
+                            }
+                        }
+                    }
+
+                    return self.put_at_leaf_locked(current, &guard, k, val, current_root, is_main_root);
+                }
+            }
+        }
+
+        /// Perform the insert on an already-locked leaf.
+        fn put_at_leaf_locked(
+            self: *Self,
+            leaf: *Leaf,
+            guard: *LockGuard,
+            k: *Key,
+            val: V,
+            layer_root: *anyopaque,
+            is_main_root: bool,
+        ) Allocator.Error!?V {
             const search = search_leaf_for_insert(leaf, k);
 
             switch (search) {
                 .found => |slot| {
                     const old = leaf.get_value(slot);
                     leaf.set_value(slot, val);
+                    guard.release();
                     return old;
                 },
                 .not_found => |logical_pos| {
                     if (!leaf.is_full()) {
+                        guard.mark_insert();
                         _ = try leaf.insert_key(logical_pos, k.*, LV.init_value(val));
-                        self.count += 1;
+                        guard.release();
+                        _ = @atomicRmw(usize, &self.count, .Add, 1, .monotonic);
                         return null;
                     }
-                    return self.handle_split_and_insert(
+                    guard.mark_insert();
+                    const r = self.handle_split_and_insert(
                         leaf,
+                        guard,
                         logical_pos,
                         k,
                         val,
                         layer_root,
                         is_main_root,
                     );
+                    return r;
                 },
                 .conflict => |slot| {
+                    guard.mark_insert();
                     try self.create_layer(leaf, slot, k, val);
-                    self.count += 1;
+                    guard.release();
+                    _ = @atomicRmw(usize, &self.count, .Add, 1, .monotonic);
                     return null;
                 },
                 .layer => |slot| {
-                    const layer_ptr = leaf.get_layer(slot) orelse
+                    const layer_info = leaf.get_layer(slot) orelse {
+                        guard.release();
                         return error.OutOfMemory;
+                    };
+                    guard.release();
                     k.shift();
-                    return self.put_at_layer(k, val, layer_ptr, true, false);
+                    return self.put_at_layer(k, val, layer_info.ptr, layer_info.is_leaf, false);
                 },
             }
         }
 
         // ====================================================================
-        //  REMOVE
+        //  REMOVE — with locking
         // ====================================================================
 
         /// Remove a key from the tree.
         /// Returns the removed value, or null if the key didn't exist.
         pub fn remove(self: *Self, key_bytes: []const u8) ?V {
             var k = Key.init(key_bytes);
-            return self.remove_at_layer(&k, self.root, self.root_is_leaf);
+            const root_tagged = @atomicLoad(usize, &self.root_tagged, .acquire);
+            const root = config.untag_ptr(root_tagged);
+            return self.remove_at_layer(&k, root.ptr, root.is_leaf, true);
         }
 
-        /// Internal recursive remove.
-        fn remove_at_layer(self: *Self, k: *Key, layer_root: *anyopaque, layer_is_leaf: bool) ?V {
-            const leaf = navigate_to_leaf_mut(layer_root, layer_is_leaf, k);
+        /// Internal recursive remove with leaf locking.
+        /// Uses OCC navigation then B-link boundary checks to find correct leaf.
+        fn remove_at_layer(self: *Self, k: *Key, layer_root: *anyopaque, layer_is_leaf: bool, is_main_root: bool) ?V {
+            while (true) {
+                // Reload root on each retry for main root.
+                var current_root = layer_root;
+                var current_is_leaf = layer_is_leaf;
+                if (is_main_root) {
+                    const rt = @atomicLoad(usize, &self.root_tagged, .acquire);
+                    const rtp = config.untag_ptr(rt);
+                    current_root = rtp.ptr;
+                    current_is_leaf = rtp.is_leaf;
+                }
+
+                // OCC navigate to leaf (retries automatically on internode changes)
+                const const_leaf = navigate_to_leaf_occ(current_root, current_is_leaf, k) orelse continue;
+                var current: *Leaf = @constCast(const_leaf);
+
+                // B-link forward: lock, check boundary, advance if needed.
+                while (true) {
+                    var guard = current.lock();
+
+                    if (current.load_next()) |next_leaf| {
+                        const next_perm = next_leaf.load_permutation();
+                        if (next_perm.size() > 0) {
+                            const first_slot = next_perm.get(0);
+                            const boundary_ikey = next_leaf.ikeys[first_slot];
+                            if (k.ikey() >= boundary_ikey) {
+                                guard.release();
+                                current = next_leaf;
+                                continue;
+                            }
+                        }
+                    }
+
+                    return self.remove_from_locked_leaf(current, &guard, k);
+                }
+            }
+        }
+
+        /// Perform remove on an already-locked leaf.
+        fn remove_from_locked_leaf(self: *Self, leaf: *Leaf, guard: *LockGuard, k: *Key) ?V {
             const result = search_leaf_for_get(
                 @as(*const Leaf, @ptrCast(@alignCast(leaf))),
                 k,
@@ -254,15 +406,23 @@ pub fn MassTree(comptime V: type) type {
                 .found => |slot| {
                     const old_val = leaf.get_value(slot);
                     leaf.remove_slot_entry(slot);
-                    self.count -= 1;
+                    guard.release();
+                    _ = @atomicRmw(usize, &self.count, .Sub, 1, .monotonic);
                     return old_val;
                 },
                 .layer => |slot| {
-                    const layer_ptr = leaf.get_layer(slot) orelse return null;
+                    const layer_info = leaf.get_layer(slot) orelse {
+                        guard.release();
+                        return null;
+                    };
+                    guard.release();
                     k.shift();
-                    return self.remove_at_layer(k, layer_ptr, true);
+                    return self.remove_at_layer(k, layer_info.ptr, layer_info.is_leaf, false);
                 },
-                .not_found => return null,
+                .not_found => {
+                    guard.release();
+                    return null;
+                },
             }
         }
 
@@ -270,45 +430,45 @@ pub fn MassTree(comptime V: type) type {
         //  Tree Traversal
         // ====================================================================
 
-        /// Navigate from a root pointer down to the leaf (const).
-        /// Uses `is_leaf` flag and `internode.height` to determine node types
-        /// instead of reading `NodeVersion.is_leaf()` from raw pointers.
-        fn navigate_to_leaf(root: *anyopaque, root_is_leaf: bool, k: *const Key) *const Leaf {
+        /// Navigate to a leaf using OCC on each internode.
+        ///
+        /// At each internode: take version snapshot, read routing keys,
+        /// select child, then verify version. If any internode changed,
+        /// returns null to signal the caller to retry from the layer root.
+        fn navigate_to_leaf_occ(root: *anyopaque, root_is_leaf: bool, k: *const Key) ?*const Leaf {
             if (root_is_leaf) {
                 return @ptrCast(@alignCast(root));
             }
 
             var inode: *const InternodeNode = @ptrCast(@alignCast(root));
             while (true) {
-                const child_idx = inode.upper_bound(k.ikey());
-                const node = inode.get_child(child_idx) orelse unreachable;
+                const ver = inode.stable();
+
+                // Use atomic nkeys load to avoid reading a partially-updated
+                // count while the internode is being modified under lock
+                // (without INSERTING_BIT set).
+                const n = inode.load_nkeys();
+                var child_idx: usize = 0;
+                const search_ikey = k.ikey();
+                while (child_idx < n) : (child_idx += 1) {
+                    if (search_ikey < inode.ikeys[child_idx]) break;
+                    if (search_ikey == inode.ikeys[child_idx]) {
+                        child_idx += 1;
+                        break;
+                    }
+                }
+                const child = inode.load_child(child_idx) orelse return null;
+
+                // Validate internode read
+                if (inode.has_changed(ver)) return null;
 
                 if (inode.height == 0) {
-                    // Children are leaves
-                    return @ptrCast(@alignCast(node));
+                    // Child is a leaf
+                    return @ptrCast(@alignCast(child));
                 }
 
-                // Children are internodes
-                inode = @ptrCast(@alignCast(node));
-            }
-        }
-
-        /// Navigate from a root pointer down to the leaf (mutable).
-        fn navigate_to_leaf_mut(root: *anyopaque, root_is_leaf: bool, k: *const Key) *Leaf {
-            if (root_is_leaf) {
-                return @ptrCast(@alignCast(root));
-            }
-
-            var inode: *const InternodeNode = @ptrCast(@alignCast(root));
-            while (true) {
-                const child_idx = inode.upper_bound(k.ikey());
-                const node = inode.get_child(child_idx) orelse unreachable;
-
-                if (inode.height == 0) {
-                    return @ptrCast(@alignCast(node));
-                }
-
-                inode = @ptrCast(@alignCast(node));
+                // Child is an internode — descend
+                inode = @ptrCast(@alignCast(child));
             }
         }
 
@@ -416,13 +576,15 @@ pub fn MassTree(comptime V: type) type {
         }
 
         // ====================================================================
-        //  Split Handling
+        //  Split Handling — with locking
         // ====================================================================
 
         /// Handle a leaf split and insert.
+        /// Caller holds the leaf lock (guard). This function releases it.
         fn handle_split_and_insert(
             self: *Self,
             leaf: *Leaf,
+            guard: *LockGuard,
             logical_pos: usize,
             k: *const Key,
             val: V,
@@ -433,8 +595,10 @@ pub fn MassTree(comptime V: type) type {
             const klx: u8 = if (k.has_suffix()) KSUF_KEYLENX else @intCast(k.current_len());
             const suf: ?[]const u8 = if (k.has_suffix()) k.suffix() else null;
 
-            const sp = leaf.calculate_split_point(logical_pos, ik) orelse
+            const sp = leaf.calculate_split_point(logical_pos, ik) orelse {
+                guard.release();
                 return error.OutOfMemory;
+            };
 
             const right = try Leaf.init(self.allocator, false);
             errdefer right.deinit(self.allocator);
@@ -450,6 +614,11 @@ pub fn MassTree(comptime V: type) type {
             );
             _ = result;
 
+            // Mark split on the guard (increments vsplit counter)
+            guard.mark_split();
+
+            // Note: split_into already links next/prev pointers.
+
             const sep_slot = right.permutation.get(0);
             const sep_ikey = right.ikeys[sep_slot];
 
@@ -462,11 +631,20 @@ pub fn MassTree(comptime V: type) type {
                 true,
             );
 
-            self.count += 1;
+            // propagate_split may have cleared ROOT_BIT on the leaf via
+            // create_new_root → mark_node_nonroot (uses @atomicRmw).
+            // Sync the guard's locked_value so release() doesn't clobber it.
+            const actual_root_bit = @atomicLoad(u32, &leaf.version.value, .monotonic) & ver_mod.NodeVersion.ROOT_BIT;
+            guard.locked_value = (guard.locked_value & ~ver_mod.NodeVersion.ROOT_BIT) | actual_root_bit;
+
+            // Release the leaf lock
+            guard.release();
+            _ = @atomicRmw(usize, &self.count, .Add, 1, .monotonic);
             return null;
         }
 
         /// Propagate a split upward through internodes.
+        /// Uses hand-over-hand locking: locks parent before modifying.
         fn propagate_split(
             self: *Self,
             left_ptr: *anyopaque,
@@ -492,15 +670,20 @@ pub fn MassTree(comptime V: type) type {
                 }
 
                 const parent: *InternodeNode = @ptrCast(@alignCast(parent_ptr.?));
+                var parent_guard = parent.lock();
 
                 if (!parent.is_full()) {
                     const child_idx = parent.find_child_index(left) orelse 0;
                     parent.insert_key_and_child(child_idx, s_ikey, right);
                     set_node_parent(right, @ptrCast(parent), leaf_level);
+                    parent_guard.release();
                     return;
                 }
 
                 // Parent full — split it
+                parent_guard.mark_insert();
+                parent_guard.mark_split();
+
                 const new_sibling = try InternodeNode.init_for_split(self.allocator, parent.height);
                 const child_idx = parent.find_child_index(left) orelse 0;
                 const split_result = parent.split_into(
@@ -519,11 +702,14 @@ pub fn MassTree(comptime V: type) type {
 
                 reparent_internode_children(new_sibling);
 
+                // Release parent lock before continuing upward
+                parent_guard.release();
+
                 left = @ptrCast(parent);
                 right = @ptrCast(new_sibling);
                 s_ikey = split_result.popup_key;
                 ly_root = ly_root;
-                main_root = (left == self.root);
+                main_root = (left == config.untag_ptr(self.root_tagged).ptr);
                 leaf_level = false;
             }
         }
@@ -554,8 +740,8 @@ pub fn MassTree(comptime V: type) type {
             mark_node_nonroot(left, at_leaf_level);
 
             if (is_main_root) {
-                self.root = @ptrCast(new_root);
-                self.root_is_leaf = false;
+                // Atomically publish the new root
+                @atomicStore(usize, &self.root_tagged, config.tag_ptr(@ptrCast(new_root), false), .release);
             } else {
                 self.update_layer_root_pointer(layer_root, @ptrCast(new_root));
             }
@@ -564,7 +750,8 @@ pub fn MassTree(comptime V: type) type {
         /// When a sublayer root splits and creates a new root, find the
         /// parent leaf slot that points to the old layer_root and update it.
         fn update_layer_root_pointer(self: *Self, old_root: *anyopaque, new_root: *anyopaque) void {
-            self.find_and_replace_layer_ptr(self.root, self.root_is_leaf, old_root, new_root);
+            const root = config.untag_ptr(self.root_tagged);
+            self.find_and_replace_layer_ptr(root.ptr, root.is_leaf, old_root, new_root);
         }
 
         /// Recursively search for a layer pointer and replace it.
@@ -583,14 +770,14 @@ pub fn MassTree(comptime V: type) type {
                 for (0..s) |i| {
                     const slot = perm.get(i);
                     if (leaf.keylenx[slot] >= LAYER_KEYLENX) {
-                        if (leaf.values[slot].try_as_layer()) |layer_ptr| {
-                            if (layer_ptr == old_ptr) {
-                                leaf.values[slot] = LV.init_layer(new_ptr);
+                        if (leaf.values[slot].try_as_layer()) |layer_info| {
+                            if (layer_info.ptr == old_ptr) {
+                                // Replacing a sublayer root with a new internode root
+                                leaf.values[slot] = LV.init_layer(new_ptr, false);
                                 return;
                             }
-                            // Recurse into sublayer (layer roots are always leaves initially,
-                            // but can become internodes — pass true as they start as leaves)
-                            self.find_and_replace_layer_ptr(layer_ptr, true, old_ptr, new_ptr);
+                            // Recurse into sublayer
+                            self.find_and_replace_layer_ptr(layer_info.ptr, layer_info.is_leaf, old_ptr, new_ptr);
                         }
                     }
                 }
@@ -639,7 +826,7 @@ pub fn MassTree(comptime V: type) type {
                 twig.permutation = Permuter15.make_sorted(1);
 
                 if (prev_twig) |pt| {
-                    pt.values[prev_twig_slot] = LV.init_layer(@ptrCast(twig));
+                    pt.values[prev_twig_slot] = LV.init_layer(@ptrCast(twig), true);
                 } else {
                     layer_root_ptr = @ptrCast(twig);
                 }
@@ -675,12 +862,12 @@ pub fn MassTree(comptime V: type) type {
 
             // Link the chain
             if (prev_twig) |pt| {
-                pt.values[prev_twig_slot] = LV.init_layer(@ptrCast(final_leaf));
+                pt.values[prev_twig_slot] = LV.init_layer(@ptrCast(final_leaf), true);
             } else {
                 layer_root_ptr = @ptrCast(final_leaf);
             }
 
-            parent_leaf.make_layer(conflict_slot, layer_root_ptr.?);
+            parent_leaf.make_layer(conflict_slot, layer_root_ptr.?, true);
         }
 
         /// Assign a key-value pair to a physical slot from a Key + optional value.
@@ -767,8 +954,8 @@ pub fn MassTree(comptime V: type) type {
                 for (0..s) |i| {
                     const slot = perm.get(i);
                     if (leaf.keylenx[slot] >= LAYER_KEYLENX) {
-                        if (leaf.values[slot].try_as_layer()) |layer_ptr| {
-                            self.destroy_node(layer_ptr, true); // layers start as leaves
+                        if (leaf.values[slot].try_as_layer()) |layer_info| {
+                            self.destroy_node(layer_info.ptr, layer_info.is_leaf);
                         }
                     }
                 }
@@ -1447,4 +1634,326 @@ test "MassTree: range single key" {
     try testing.expectEqualSlices(u8, "bbb", e.key);
     try testing.expectEqual(@as(u64, 2), e.value);
     try testing.expect(it.next() == null);
+}
+
+// ============================================================================
+//  Concurrent Tests — Phase 4
+// ============================================================================
+
+/// Thread worker for concurrent disjoint insert tests.
+/// Each thread inserts keys in its own non-overlapping range.
+fn concurrent_insert_worker(tree_ptr: *MassTree(u64), tid: usize, keys_per_thread: usize) void {
+    const base = tid * 1000;
+    for (0..keys_per_thread) |i| {
+        const key_val: u64 = @intCast(base + i);
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, key_val, .big);
+        _ = tree_ptr.put(&buf, key_val) catch return;
+    }
+}
+
+test "MassTree concurrent: 2 threads disjoint inserts" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    const NUM_THREADS = 2;
+    const KEYS_PER_THREAD = 100;
+
+    var threads: [NUM_THREADS]std.Thread = undefined;
+    for (0..NUM_THREADS) |tid| {
+        threads[tid] = try std.Thread.spawn(.{}, concurrent_insert_worker, .{ &tree, tid, KEYS_PER_THREAD });
+    }
+    for (&threads) |*t| t.join();
+
+    try testing.expectEqual(@as(usize, NUM_THREADS * KEYS_PER_THREAD), tree.len());
+
+    // Verify all keys present with correct values
+    for (0..NUM_THREADS) |tid| {
+        const base = tid * 1000;
+        for (0..KEYS_PER_THREAD) |i| {
+            const key_val: u64 = @intCast(base + i);
+            var buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &buf, key_val, .big);
+            const val = tree.get(&buf);
+            try testing.expect(val != null);
+            try testing.expectEqual(key_val, val.?);
+        }
+    }
+}
+
+test "MassTree concurrent: 4 threads disjoint inserts" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    const NUM_THREADS = 4;
+    const KEYS_PER_THREAD = 100;
+
+    var threads: [NUM_THREADS]std.Thread = undefined;
+    for (0..NUM_THREADS) |tid| {
+        threads[tid] = try std.Thread.spawn(.{}, concurrent_insert_worker, .{ &tree, tid, KEYS_PER_THREAD });
+    }
+    for (&threads) |*t| t.join();
+
+    try testing.expectEqual(@as(usize, NUM_THREADS * KEYS_PER_THREAD), tree.len());
+
+    // Verify all keys present
+    for (0..NUM_THREADS) |tid| {
+        const base = tid * 1000;
+        for (0..KEYS_PER_THREAD) |i| {
+            const key_val: u64 = @intCast(base + i);
+            var buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &buf, key_val, .big);
+            try testing.expect(tree.get(&buf) != null);
+        }
+    }
+}
+
+/// Thread worker for overlapping key inserts.
+/// All threads insert the same key range; last writer wins.
+fn concurrent_overlap_worker(tree_ptr: *MassTree(u64), tid: usize, num_keys: usize) void {
+    for (0..num_keys) |i| {
+        const key_val: u64 = @intCast(i);
+        const val: u64 = @intCast(tid * 1000 + i);
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, key_val, .big);
+        _ = tree_ptr.put(&buf, val) catch return;
+    }
+}
+
+test "MassTree concurrent: 2 threads overlapping inserts" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    const NUM_THREADS = 2;
+    const NUM_KEYS = 100;
+
+    var threads: [NUM_THREADS]std.Thread = undefined;
+    for (0..NUM_THREADS) |tid| {
+        threads[tid] = try std.Thread.spawn(.{}, concurrent_overlap_worker, .{ &tree, tid, NUM_KEYS });
+    }
+    for (&threads) |*t| t.join();
+
+    // With overlapping keys, tree should have exactly NUM_KEYS entries
+    try testing.expectEqual(@as(usize, NUM_KEYS), tree.len());
+
+    // Verify all keys present (value is from whichever thread wrote last)
+    for (0..NUM_KEYS) |i| {
+        const key_val: u64 = @intCast(i);
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, key_val, .big);
+        try testing.expect(tree.get(&buf) != null);
+    }
+}
+
+/// Reader thread: reads pre-populated keys and verifies they exist.
+fn concurrent_reader_worker(tree_ptr: *const MassTree(u64), num_keys: usize, found_count: *std.atomic.Value(usize)) void {
+    var count: usize = 0;
+    for (0..num_keys) |i| {
+        const key_val: u64 = @intCast(i);
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, key_val, .big);
+        if (tree_ptr.get(&buf) != null) {
+            count += 1;
+        }
+    }
+    _ = found_count.fetchAdd(count, .monotonic);
+}
+
+/// Writer thread: inserts new keys in a disjoint range.
+fn concurrent_writer_worker(tree_ptr: *MassTree(u64), base: usize, num_keys: usize) void {
+    for (0..num_keys) |i| {
+        const key_val: u64 = @intCast(base + i);
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, key_val, .big);
+        _ = tree_ptr.put(&buf, key_val) catch return;
+    }
+}
+
+test "MassTree concurrent: read + write (1 writer, 1 reader)" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    // Pre-populate 100 keys
+    const PRE_POP = 100;
+    for (0..PRE_POP) |i| {
+        const key_val: u64 = @intCast(i);
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, key_val, .big);
+        _ = try tree.put(&buf, key_val);
+    }
+
+    try testing.expectEqual(@as(usize, PRE_POP), tree.len());
+
+    var found_count = std.atomic.Value(usize).init(0);
+
+    // Writer adds keys 1000..1099, reader reads keys 0..99
+    const writer = try std.Thread.spawn(.{}, concurrent_writer_worker, .{ &tree, 1000, 100 });
+    const reader = try std.Thread.spawn(.{}, concurrent_reader_worker, .{ @as(*const MassTree(u64), &tree), PRE_POP, &found_count });
+
+    writer.join();
+    reader.join();
+
+    // All pre-populated keys should still be found by reader
+    try testing.expectEqual(@as(usize, PRE_POP), found_count.load(.monotonic));
+    // Final tree should have pre-populated + writer keys
+    try testing.expectEqual(@as(usize, PRE_POP + 100), tree.len());
+}
+
+test "MassTree concurrent: inserts trigger splits (2 threads, 200 keys each)" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    const NUM_THREADS = 2;
+    const KEYS_PER_THREAD = 200;
+
+    var threads: [NUM_THREADS]std.Thread = undefined;
+    for (0..NUM_THREADS) |tid| {
+        threads[tid] = try std.Thread.spawn(.{}, concurrent_insert_worker, .{ &tree, tid, KEYS_PER_THREAD });
+    }
+    for (&threads) |*t| t.join();
+
+    try testing.expectEqual(@as(usize, NUM_THREADS * KEYS_PER_THREAD), tree.len());
+
+    // Verify all keys with correct values
+    for (0..NUM_THREADS) |tid| {
+        const base = tid * 1000;
+        for (0..KEYS_PER_THREAD) |i| {
+            const key_val: u64 = @intCast(base + i);
+            var buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &buf, key_val, .big);
+            const val = tree.get(&buf);
+            try testing.expect(val != null);
+            try testing.expectEqual(key_val, val.?);
+        }
+    }
+}
+
+/// Stress test worker: inserts keys and immediately reads them back.
+fn stress_insert_verify_worker(tree_ptr: *MassTree(u64), tid: usize, keys_per_thread: usize, errors: *std.atomic.Value(usize)) void {
+    const base = tid * 10000;
+    for (0..keys_per_thread) |i| {
+        const key_val: u64 = @intCast(base + i);
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, key_val, .big);
+        _ = tree_ptr.put(&buf, key_val) catch {
+            _ = errors.fetchAdd(1, .monotonic);
+            return;
+        };
+        // Immediate read-back verification
+        if (tree_ptr.get(&buf)) |val| {
+            if (val != key_val) {
+                _ = errors.fetchAdd(1, .monotonic);
+            }
+        } else {
+            _ = errors.fetchAdd(1, .monotonic);
+        }
+    }
+}
+
+test "MassTree concurrent: stress 4 threads × 500 keys with read-back" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    const NUM_THREADS = 4;
+    const KEYS_PER_THREAD = 500;
+
+    var errors = std.atomic.Value(usize).init(0);
+
+    var threads: [NUM_THREADS]std.Thread = undefined;
+    for (0..NUM_THREADS) |tid| {
+        threads[tid] = try std.Thread.spawn(.{}, stress_insert_verify_worker, .{ &tree, tid, KEYS_PER_THREAD, &errors });
+    }
+    for (&threads) |*t| t.join();
+
+    try testing.expectEqual(@as(usize, 0), errors.load(.monotonic));
+    try testing.expectEqual(@as(usize, NUM_THREADS * KEYS_PER_THREAD), tree.len());
+
+    // Full verification pass
+    for (0..NUM_THREADS) |tid| {
+        const base = tid * 10000;
+        for (0..KEYS_PER_THREAD) |i| {
+            const key_val: u64 = @intCast(base + i);
+            var buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &buf, key_val, .big);
+            const val = tree.get(&buf);
+            try testing.expect(val != null);
+            try testing.expectEqual(key_val, val.?);
+        }
+    }
+}
+
+/// Long key worker: inserts 24-byte keys spanning multiple trie layers.
+fn concurrent_long_key_worker(tree_ptr: *MassTree(u64), tid: usize, num_keys: usize) void {
+    for (0..num_keys) |i| {
+        // Create a 24-byte key like "thread_XX_key_XXXXXXXX"
+        var buf: [24]u8 = [_]u8{0} ** 24;
+        _ = std.fmt.bufPrint(&buf, "thread_{d:0>2}_key_{d:0>8}", .{ tid, i }) catch return;
+        const val: u64 = @intCast(tid * 1000 + i);
+        _ = tree_ptr.put(&buf, val) catch return;
+    }
+}
+
+test "MassTree concurrent: long keys multi-layer (4 threads)" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    const NUM_THREADS = 4;
+    const KEYS_PER_THREAD = 50;
+
+    var threads: [NUM_THREADS]std.Thread = undefined;
+    for (0..NUM_THREADS) |tid| {
+        threads[tid] = try std.Thread.spawn(.{}, concurrent_long_key_worker, .{ &tree, tid, KEYS_PER_THREAD });
+    }
+    for (&threads) |*t| t.join();
+
+    try testing.expectEqual(@as(usize, NUM_THREADS * KEYS_PER_THREAD), tree.len());
+
+    // Verify all keys
+    for (0..NUM_THREADS) |tid| {
+        for (0..KEYS_PER_THREAD) |i| {
+            var buf: [24]u8 = [_]u8{0} ** 24;
+            _ = std.fmt.bufPrint(&buf, "thread_{d:0>2}_key_{d:0>8}", .{ tid, i }) catch continue;
+            const expected: u64 = @intCast(tid * 1000 + i);
+            const val = tree.get(&buf);
+            try testing.expect(val != null);
+            try testing.expectEqual(expected, val.?);
+        }
+    }
+}
+
+/// Sequential key worker: threads insert interleaved sequential keys.
+fn concurrent_sequential_worker(tree_ptr: *MassTree(u64), tid: usize, num_threads: usize, total_keys: usize) void {
+    var i: usize = tid;
+    while (i < total_keys) : (i += num_threads) {
+        const key_val: u64 = @intCast(i);
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, key_val, .big);
+        _ = tree_ptr.put(&buf, key_val) catch return;
+    }
+}
+
+test "MassTree concurrent: interleaved sequential keys (high split contention)" {
+    var tree = try MassTree(u64).init(testing.allocator);
+    defer tree.deinit();
+
+    const NUM_THREADS = 4;
+    const TOTAL_KEYS = 1000;
+
+    var threads: [NUM_THREADS]std.Thread = undefined;
+    for (0..NUM_THREADS) |tid| {
+        threads[tid] = try std.Thread.spawn(.{}, concurrent_sequential_worker, .{ &tree, tid, NUM_THREADS, TOTAL_KEYS });
+    }
+    for (&threads) |*t| t.join();
+
+    try testing.expectEqual(@as(usize, TOTAL_KEYS), tree.len());
+
+    // Verify all keys
+    for (0..TOTAL_KEYS) |i| {
+        const key_val: u64 = @intCast(i);
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, key_val, .big);
+        const val = tree.get(&buf);
+        try testing.expect(val != null);
+        try testing.expectEqual(key_val, val.?);
+    }
 }
