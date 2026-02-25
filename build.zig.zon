@@ -1,0 +1,14 @@
+.{
+    .fingerprint = 0x7fc5cd216cefe770,
+    .name = .masstree_zig,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.14.0",
+    .paths = .{
+        "src",
+        "tests",
+        "bench",
+        "docs",
+        "build.zig",
+        "build.zig.zon",
+    },
+}

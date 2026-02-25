@@ -1,0 +1,14 @@
+# Zig build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+
+# Benchmark results
+bench/results/
