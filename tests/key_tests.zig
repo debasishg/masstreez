@@ -54,8 +54,8 @@ test "ordering: multi-byte keys sorted correctly" {
 
 test "slice_count: boundary lengths" {
     try testing.expectEqual(@as(usize, 0), key.slice_count(""));
-    try testing.expectEqual(@as(usize, 1), key.slice_count("1234567"));   // 7
-    try testing.expectEqual(@as(usize, 1), key.slice_count("12345678"));  // 8
+    try testing.expectEqual(@as(usize, 1), key.slice_count("1234567")); // 7
+    try testing.expectEqual(@as(usize, 1), key.slice_count("12345678")); // 8
     try testing.expectEqual(@as(usize, 2), key.slice_count("123456789")); // 9
     try testing.expectEqual(@as(usize, 3), key.slice_count("12345678901234567")); // 17
 }
