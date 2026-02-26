@@ -129,6 +129,21 @@ pub fn LeafNode(comptime V: type) type {
             return node;
         }
 
+        /// Initialize a pre-allocated leaf node in-place.
+        ///
+        /// Used with pool allocation where memory is already allocated
+        /// via `node_pool.pool_alloc`.
+        pub fn init_at(self: *Self, make_root: bool, allocator: Allocator) void {
+            self.* = .{
+                .version = NodeVersion.init(true),
+                .permutation = Permuter15.empty(),
+                .suffix = SuffixBag.init_empty(allocator),
+            };
+            if (make_root) {
+                self.version.mark_root();
+            }
+        }
+
         /// Create a new leaf as a layer root (root + null parent).
         pub fn init_layer_root(allocator: Allocator) Allocator.Error!*Self {
             const node = try init(allocator, true);

@@ -76,6 +76,17 @@ pub const InternodeNode = struct {
         return node;
     }
 
+    /// Initialize a pre-allocated internode in-place.
+    ///
+    /// Used with pool allocation where memory is already allocated
+    /// via `node_pool.pool_alloc`.
+    pub fn init_at(self: *Self, height_val: u8) void {
+        self.* = .{
+            .version = NodeVersion.init(false),
+            .height = height_val,
+        };
+    }
+
     /// Create a new internode marked as root.
     pub fn init_root(allocator: Allocator, height_val: u8) Allocator.Error!*Self {
         const node = try init(allocator, height_val);
@@ -300,6 +311,37 @@ pub const InternodeNode = struct {
         // Release ordering ensures all prior writes to ikeys/children
         // are visible to readers who Acquire-load nkeys.
         self.store_nkeys(@intCast(n + 1));
+    }
+
+    // ========================================================================
+    //  Remove Child (used by coalesce)
+    // ========================================================================
+
+    /// Remove key[child_idx − 1] and child[child_idx] from this internode.
+    ///
+    /// Shifts remaining keys and children left to fill the gap.
+    /// Caller must hold the lock.  `child_idx` must be > 0 (leftmost
+    /// child removal requires different handling).
+    pub fn remove_child(self: *Self, child_idx: usize) void {
+        const n: usize = @as(usize, self.nkeys);
+        std.debug.assert(child_idx > 0);
+        std.debug.assert(child_idx <= n);
+
+        // Shift keys left: key[child_idx-1 .. n-2] ← key[child_idx .. n-1]
+        var i: usize = child_idx - 1;
+        while (i + 1 < n) : (i += 1) {
+            self.ikeys[i] = self.ikeys[i + 1];
+        }
+
+        // Shift children left: child[child_idx .. n-1] ← child[child_idx+1 .. n]
+        i = child_idx;
+        while (i < n) : (i += 1) {
+            self.children[i] = self.children[i + 1];
+        }
+        self.children[n] = null;
+
+        // Publish: atomic nkeys store.
+        self.store_nkeys(@intCast(n - 1));
     }
 
     // ========================================================================

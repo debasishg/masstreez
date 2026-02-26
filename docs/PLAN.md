@@ -153,14 +153,44 @@ and per-node locking for writers.
 5. Stale root pointer on retry → reload `root_tagged` each iteration
 6. `get()` returning null without B-link check → added forward walk on `not_found`
 
-## Phase 5 — Epoch-Based Reclamation (~1,500 lines)
+## Phase 5 — Epoch-Based Reclamation (~1,500 lines) ✅
 
-| Module | Description |
-|--------|-------------|
-| `ebr.zig` | Three-epoch collector with per-thread pins and retirement lists |
-| `node_pool.zig` | Thread-local size-class node pools for leaf/internode alloc |
-| Coalesce queue | Lock-free queue of empty leaves for deferred cleanup |
-| Iterative teardown | Stack-based traversal replacing recursive `deinit()` |
+127/127 tests passing (13 new Phase 5 tests + 114 existing).
+
+| Module | Rust Source | Description | Status |
+|--------|------------|-------------|--------|
+| `ebr.zig` | `seize` crate | Three-epoch collector with per-thread pins and retirement lists | ✅ |
+| `node_pool.zig` | `pool.rs` | Thread-local size-class node pools for leaf/internode alloc | ✅ |
+| `coalesce.zig` | `tree/coalesce.rs` | Lock-free Treiber stack queue for deferred empty-leaf cleanup | ✅ |
+| Iterative teardown | `tree.rs` drop | Stack-based traversal replacing recursive `deinit()` | ✅ |
+| EBR integration | — | Pin/unpin guards in `get`/`put`/`remove`, defer-retire in coalesce | ✅ |
+
+### Key design decisions for Phase 5:
+- **Three-epoch scheme**: global epoch counter (u64, monotonic). Items retired
+  during epoch E are safe to reclaim at epoch E+2. Per-thread bins indexed by
+  `epoch % 3`. `BATCH_THRESHOLD = 128` triggers epoch advancement attempt.
+- **Collector as heap pointer**: `collector: *ebr.Collector` stored in `MassTree`
+  so that `get(*const Self)` can call mutable collector methods through the
+  pointer without violating Zig's const semantics.
+- **Thread-local EBR state caching**: `threadlocal var tls_collector_addr: usize`
+  keyed by collector pointer address enables per-collector thread registration
+  without mutex overhead on the hot path.
+- **Node pool size classes**: `CACHE_LINE = 64` granularity, up to 20 classes
+  (1280 bytes max), capacity 512 per class per thread. Intrusive freelists
+  reuse the node memory itself for the `next` pointer.
+- **Lock-free coalesce queue**: Treiber stack (atomic CAS on head pointer).
+  `MAX_REQUEUE = 10` attempts before dropping entries. `process_batch(limit)`
+  locks leaf → verifies empty → marks deleted → unlinks B-link → removes from
+  parent internode → retires via EBR guard.
+- **Iterative teardown**: `destroy_tree_iterative()` uses `ArrayList(TraversalWork)`
+  stack with tagged union variants (`.visit`, `.free_leaf`, `.free_internode`).
+  LIFO ordering ensures children are freed before parents. Replaces recursive
+  `destroy_node()` to avoid stack overflow on deep trees.
+
+### Bugs found and fixed:
+1. Zig 0.15 `ArrayList` API change: `init()` no longer takes allocator; allocator
+   passed to individual methods (`deinit(allocator)`, `append(allocator, item)`)
+2. `popOrNull()` renamed to `pop()` (returns `?T`) in Zig 0.15
 
 ## Phase 6 — Performance & Polish (~500 lines)
 
@@ -180,11 +210,11 @@ and per-node locking for writers.
 | Phase 2 | ~2,500 | ~1,960 |
 | Phase 3 | ~2,000 | ~775 |
 | Phase 4 | ~2,500 | ~1,200 |
-| Phase 5 | ~1,500 | — |
+| Phase 5 | ~1,500 | ~957 (new) + ~150 (integration) |
 | Phase 6 | ~500 | — |
-| **Total** | **~12,000** | **~6,610 so far** |
+| **Total** | **~12,000** | **~7,764 so far** |
 
-Current codebase: 6,610 lines in `src/`, 782 lines in `tests/`, 114/114 tests passing.
+Current codebase: 7,764 lines in `src/`, 782 lines in `tests/`, 127/127 tests passing.
 
 (vs ~25,000 lines Rust — Zig is more concise due to comptime generics, no
 trait boilerplate, no unsafe ceremony)

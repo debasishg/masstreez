@@ -3,6 +3,8 @@
 //! ## Phase 1 — Core Data Structures
 //! ## Phase 2 — Single-Threaded Tree Operations
 //! ## Phase 3 — Range Scan
+//! ## Phase 4 — Concurrency
+//! ## Phase 5 — Epoch-Based Reclamation
 //!
 //! This module re-exports core types and the MassTree API.
 
@@ -23,6 +25,11 @@ pub const interior = @import("interior.zig");
 // -- Tree --
 pub const tree = @import("tree.zig");
 pub const range = @import("range.zig");
+
+// -- Phase 5: EBR & Node Management --
+pub const ebr = @import("ebr.zig");
+pub const node_pool = @import("node_pool.zig");
+pub const coalesce = @import("coalesce.zig");
 
 // -- Convenience re-exports --
 pub const Key = key.Key;

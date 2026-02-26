@@ -37,6 +37,29 @@ const perm_mod = @import("permuter.zig");
 const Permuter15 = perm_mod.Permuter15;
 const config = @import("config.zig");
 const range_mod = @import("range.zig");
+const ebr_mod = @import("ebr.zig");
+const node_pool = @import("node_pool.zig");
+const coalesce_mod = @import("coalesce.zig");
+
+// ============================================================================
+//  Thread-local EBR State
+// ============================================================================
+
+/// Thread-local cache for fast EBR pinning.
+/// Caches the last-used collector/thread pair to avoid re-registration.
+threadlocal var tls_thread: ?*ebr_mod.ThreadState = null;
+threadlocal var tls_collector_addr: usize = 0;
+
+/// Get (or lazily register) the current thread's EBR state for a collector.
+fn ensure_registered(collector: *ebr_mod.Collector) Allocator.Error!*ebr_mod.ThreadState {
+    if (tls_collector_addr == @intFromPtr(collector)) {
+        if (tls_thread) |ts| return ts;
+    }
+    const ts = try collector.register();
+    tls_thread = ts;
+    tls_collector_addr = @intFromPtr(collector);
+    return ts;
+}
 
 // ============================================================================
 //  InsertSearchResult
@@ -65,6 +88,7 @@ pub fn MassTree(comptime V: type) type {
 
     return struct {
         const Self = @This();
+        const CoalesceQ = coalesce_mod.CoalesceQueue(V);
 
         /// Tagged root pointer — low bit stores is_leaf flag.
         /// Use config.untag_ptr() to extract the pointer and type.
@@ -76,26 +100,58 @@ pub fn MassTree(comptime V: type) type {
         /// Allocator used for all node allocations.
         allocator: Allocator,
 
+        /// Epoch-based reclamation collector (heap-allocated for const access).
+        collector: *ebr_mod.Collector,
+
+        /// Coalesce queue for deferred empty-leaf cleanup (heap-allocated).
+        coalesce_queue: *CoalesceQ,
+
         // ====================================================================
         //  Construction / Destruction
         // ====================================================================
 
         /// Create an empty MassTree.
         pub fn init(allocator: Allocator) Allocator.Error!Self {
+            const collector = try allocator.create(ebr_mod.Collector);
+            errdefer allocator.destroy(collector);
+            collector.* = ebr_mod.Collector.init(allocator);
+
+            const queue = try allocator.create(CoalesceQ);
+            errdefer allocator.destroy(queue);
+            queue.* = CoalesceQ.init(allocator);
+
             const leaf = try Leaf.init(allocator, true);
             return .{
                 .root_tagged = config.tag_ptr(@ptrCast(leaf), true),
                 .count = 0,
                 .allocator = allocator,
+                .collector = collector,
+                .coalesce_queue = queue,
             };
         }
 
-        /// Destroy the tree, freeing all nodes recursively.
+        /// Destroy the tree, freeing all nodes.
+        ///
+        /// Uses iterative (stack-based) traversal instead of recursion
+        /// to avoid stack overflow on deep trees with many sublayers.
+        /// Bypasses the node pool during teardown (all nodes freed directly).
         pub fn deinit(self: *Self) void {
+            // Drain coalesce queue (discard entries, don't process them).
+            self.coalesce_queue.deinit();
+
+            // Reclaim all pending EBR retirements.
+            self.collector.reclaim_all();
+
+            // Iterative teardown of the tree structure.
             const tagged = config.untag_ptr(self.root_tagged);
-            self.destroy_node(tagged.ptr, tagged.is_leaf);
+            self.destroy_tree_iterative(tagged.ptr, tagged.is_leaf);
             self.root_tagged = 0;
             self.count = 0;
+
+            // Free collector and queue.
+            self.collector.deinit();
+            self.allocator.destroy(self.collector);
+            self.allocator.destroy(self.coalesce_queue);
         }
 
         /// Return the number of key-value pairs.
@@ -156,7 +212,12 @@ pub fn MassTree(comptime V: type) type {
         /// Uses the OCC protocol: at each node, take a version snapshot,
         /// perform reads, then verify the version hasn't changed.
         /// If any version check fails, restart from the tree root.
+        /// Pins the current thread to the EBR epoch for safe access.
         pub fn get(self: *const Self, key_bytes: []const u8) ?V {
+            const ts = ensure_registered(self.collector) catch return null;
+            var guard = self.collector.pin(ts);
+            defer guard.unpin();
+
             // Full restart on any OCC validation failure
             retry: while (true) {
                 var k = Key.init(key_bytes);
@@ -221,7 +282,12 @@ pub fn MassTree(comptime V: type) type {
 
         /// Insert or update a key-value pair.
         /// Returns the old value if the key already existed.
+        /// Pins the current thread to the EBR epoch for safe access.
         pub fn put(self: *Self, key_bytes: []const u8, val: V) Allocator.Error!?V {
+            const ts = try ensure_registered(self.collector);
+            var guard = self.collector.pin(ts);
+            defer guard.unpin();
+
             var k = Key.init(key_bytes);
             const root_tagged = @atomicLoad(usize, &self.root_tagged, .acquire);
             const root = config.untag_ptr(root_tagged);
@@ -348,7 +414,12 @@ pub fn MassTree(comptime V: type) type {
 
         /// Remove a key from the tree.
         /// Returns the removed value, or null if the key didn't exist.
+        /// Pins the current thread to the EBR epoch for safe access.
         pub fn remove(self: *Self, key_bytes: []const u8) ?V {
+            const ts = ensure_registered(self.collector) catch return null;
+            var guard = self.collector.pin(ts);
+            defer guard.unpin();
+
             var k = Key.init(key_bytes);
             const root_tagged = @atomicLoad(usize, &self.root_tagged, .acquire);
             const root = config.untag_ptr(root_tagged);
@@ -406,6 +477,13 @@ pub fn MassTree(comptime V: type) type {
                 .found => |slot| {
                     const old_val = leaf.get_value(slot);
                     leaf.remove_slot_entry(slot);
+
+                    // Schedule empty leaf for deferred coalesce cleanup.
+                    if (leaf.permutation.size() == 0) {
+                        leaf.modstate = leaf_mod.ModState.EMPTY;
+                        self.coalesce_queue.schedule(leaf);
+                    }
+
                     guard.release();
                     _ = @atomicRmw(usize, &self.count, .Sub, 1, .monotonic);
                     return old_val;
@@ -941,36 +1019,91 @@ pub fn MassTree(comptime V: type) type {
         }
 
         // ====================================================================
-        //  Recursive Destruction
+        //  Iterative Teardown (replaces recursive destroy_node)
         // ====================================================================
 
-        /// Recursively free all nodes in the tree.
-        fn destroy_node(self: *Self, node: *anyopaque, is_leaf: bool) void {
-            if (is_leaf) {
-                const leaf: *Leaf = @ptrCast(@alignCast(node));
-                // Recursively destroy sublayers
-                const perm = leaf.permutation;
-                const s = perm.size();
-                for (0..s) |i| {
-                    const slot = perm.get(i);
-                    if (leaf.keylenx[slot] >= LAYER_KEYLENX) {
-                        if (leaf.values[slot].try_as_layer()) |layer_info| {
-                            self.destroy_node(layer_info.ptr, layer_info.is_leaf);
+        /// Work item for the iterative teardown stack.
+        const TraversalWork = union(enum) {
+            /// Visit a node: push its children/sublayers + a free item.
+            visit: struct { ptr: *anyopaque, is_leaf: bool },
+            /// Free a leaf (after all sublayers have been freed).
+            free_leaf: *Leaf,
+            /// Free an internode (after all children have been freed).
+            free_internode: *InternodeNode,
+        };
+
+        /// Iteratively free all nodes in the tree using an explicit stack.
+        ///
+        /// Avoids stack overflow on deeply nested sublayer chains.
+        /// Uses LIFO ordering: push free item first, then children/sublayers.
+        /// Children are processed before the free item (LIFO pop order).
+        fn destroy_tree_iterative(self: *Self, root: *anyopaque, root_is_leaf: bool) void {
+            var stack: std.ArrayList(TraversalWork) = .{};
+            defer stack.deinit(self.allocator);
+
+            stack.append(self.allocator, .{ .visit = .{ .ptr = root, .is_leaf = root_is_leaf } }) catch return;
+
+            while (stack.pop()) |work| {
+                switch (work) {
+                    .visit => |info| {
+                        if (info.is_leaf) {
+                            const leaf: *Leaf = @ptrCast(@alignCast(info.ptr));
+                            // Push free FIRST (will be popped LAST for this subtree).
+                            stack.append(self.allocator, .{ .free_leaf = leaf }) catch {};
+                            // Push sublayers (will be processed before the free).
+                            const perm = leaf.permutation;
+                            const s = perm.size();
+                            for (0..s) |i| {
+                                const slot = perm.get(i);
+                                if (leaf.keylenx[slot] >= LAYER_KEYLENX) {
+                                    if (leaf.values[slot].try_as_layer()) |layer_info| {
+                                        stack.append(self.allocator, .{ .visit = .{
+                                            .ptr = layer_info.ptr,
+                                            .is_leaf = layer_info.is_leaf,
+                                        } }) catch {};
+                                    }
+                                }
+                            }
+                        } else {
+                            const inode: *InternodeNode = @ptrCast(@alignCast(info.ptr));
+                            // Push free FIRST.
+                            stack.append(self.allocator, .{ .free_internode = inode }) catch {};
+                            // Push children.
+                            const n: usize = @as(usize, inode.nkeys) + 1;
+                            const children_are_leaves = (inode.height == 0);
+                            for (0..n) |i| {
+                                if (inode.children[i]) |child| {
+                                    stack.append(self.allocator, .{ .visit = .{
+                                        .ptr = child,
+                                        .is_leaf = children_are_leaves,
+                                    } }) catch {};
+                                }
+                            }
                         }
-                    }
+                    },
+                    .free_leaf => |leaf| {
+                        leaf.deinit(self.allocator);
+                    },
+                    .free_internode => |inode| {
+                        inode.deinit(self.allocator);
+                    },
                 }
-                leaf.deinit(self.allocator);
-            } else {
-                const inode: *InternodeNode = @ptrCast(@alignCast(node));
-                const n: usize = @as(usize, inode.nkeys) + 1;
-                const children_are_leaves = (inode.height == 0);
-                for (0..n) |i| {
-                    if (inode.children[i]) |child| {
-                        self.destroy_node(child, children_are_leaves);
-                    }
-                }
-                inode.deinit(self.allocator);
             }
+        }
+
+        // ====================================================================
+        //  Coalesce Processing
+        // ====================================================================
+
+        /// Process pending empty-leaf cleanup entries.
+        ///
+        /// Call periodically (e.g., after a batch of removes) to reclaim
+        /// empty leaves.  Pins the current thread for EBR safety.
+        pub fn process_coalesce(self: *Self) void {
+            const ts = ensure_registered(self.collector) catch return;
+            var guard = self.collector.pin(ts);
+            defer guard.unpin();
+            self.coalesce_queue.process_batch(32, &guard);
         }
     };
 }
