@@ -40,6 +40,8 @@ const range_mod = @import("range.zig");
 const ebr_mod = @import("ebr.zig");
 const node_pool = @import("node_pool.zig");
 const coalesce_mod = @import("coalesce.zig");
+const pf = @import("prefetch.zig");
+const ShardedCounter = @import("shard_counter.zig").ShardedCounter;
 
 // ============================================================================
 //  Thread-local EBR State
@@ -94,8 +96,8 @@ pub fn MassTree(comptime V: type) type {
         /// Use config.untag_ptr() to extract the pointer and type.
         root_tagged: usize,
 
-        /// Number of key-value pairs in the tree.
-        count: usize,
+        /// Approximate number of key-value pairs (sharded for scalability).
+        shard_count: ShardedCounter,
 
         /// Allocator used for all node allocations.
         allocator: Allocator,
@@ -123,7 +125,7 @@ pub fn MassTree(comptime V: type) type {
             const leaf = try Leaf.init(allocator, true);
             return .{
                 .root_tagged = config.tag_ptr(@ptrCast(leaf), true),
-                .count = 0,
+                .shard_count = .{},
                 .allocator = allocator,
                 .collector = collector,
                 .coalesce_queue = queue,
@@ -146,7 +148,7 @@ pub fn MassTree(comptime V: type) type {
             const tagged = config.untag_ptr(self.root_tagged);
             self.destroy_tree_iterative(tagged.ptr, tagged.is_leaf);
             self.root_tagged = 0;
-            self.count = 0;
+            self.shard_count.reset();
 
             // Free collector and queue.
             self.collector.deinit();
@@ -154,14 +156,17 @@ pub fn MassTree(comptime V: type) type {
             self.allocator.destroy(self.coalesce_queue);
         }
 
-        /// Return the number of key-value pairs.
+        /// Return the approximate number of key-value pairs.
+        ///
+        /// Exact when no concurrent modifications are in flight.
+        /// Uses sharded counters to avoid contention on the hot path.
         pub fn len(self: *const Self) usize {
-            return @atomicLoad(usize, &self.count, .monotonic);
+            return self.shard_count.load();
         }
 
         /// Check if the tree is empty.
         pub fn is_empty(self: *const Self) bool {
-            return @atomicLoad(usize, &self.count, .monotonic) == 0;
+            return self.shard_count.load() == 0;
         }
 
         // ====================================================================
@@ -230,8 +235,10 @@ pub fn MassTree(comptime V: type) type {
                 // Layer loop: descend through trie layers
                 while (true) {
                     // OCC navigate to the target leaf
-                    var leaf = navigate_to_leaf_occ(node_ptr, is_leaf, &k) orelse
+                    var leaf = navigate_to_leaf_occ(node_ptr, is_leaf, &k) orelse {
+                        @branchHint(.unlikely);
                         continue :retry;
+                    };
 
                     // B-link forward: if key is beyond this leaf, walk
                     // the next-pointer chain to the correct leaf.
@@ -243,7 +250,10 @@ pub fn MassTree(comptime V: type) type {
                         const result = search_leaf_for_get(leaf, &k);
 
                         // Validate: if leaf changed, restart this leaf
-                        if (leaf.has_changed(version)) continue :forward;
+                        if (leaf.has_changed(version)) {
+                            @branchHint(.unlikely);
+                            continue :forward;
+                        }
 
                         // OCC passed — act on result
                         switch (result) {
@@ -259,11 +269,14 @@ pub fn MassTree(comptime V: type) type {
                                 // Check B-link: key might be in successor leaf
                                 // due to concurrent split during internode navigation.
                                 const next = leaf.load_next() orelse return null;
+                                // Prefetch two hops ahead for pipelined B-link walk
+                                pf.prefetch_blink_ahead(@ptrCast(next.load_next()));
                                 const next_perm = next.load_permutation();
                                 if (next_perm.size() > 0) {
                                     const first_slot = next_perm.get(0);
                                     const boundary_ikey = next.ikeys[first_slot];
                                     if (k.ikey() >= boundary_ikey) {
+                                        @branchHint(.unlikely);
                                         leaf = next;
                                         continue :forward;
                                     }
@@ -323,8 +336,14 @@ pub fn MassTree(comptime V: type) type {
                 }
 
                 // OCC navigate to leaf (retries automatically on internode changes)
-                const const_leaf = navigate_to_leaf_occ(current_root, current_is_leaf, k) orelse continue;
+                const const_leaf = navigate_to_leaf_occ(current_root, current_is_leaf, k) orelse {
+                    @branchHint(.unlikely);
+                    continue;
+                };
                 var current: *Leaf = @constCast(const_leaf);
+
+                // Prefetch leaf for write before locking
+                pf.prefetch_leaf_write(@ptrCast(current));
 
                 // B-link forward: lock each candidate leaf, check boundary,
                 // advance to successor if our key is beyond this leaf's range.
@@ -338,6 +357,7 @@ pub fn MassTree(comptime V: type) type {
                             const first_slot = next_perm.get(0);
                             const boundary_ikey = next_leaf.ikeys[first_slot];
                             if (k.ikey() >= boundary_ikey) {
+                                @branchHint(.unlikely);
                                 guard.release();
                                 current = next_leaf;
                                 continue;
@@ -374,7 +394,7 @@ pub fn MassTree(comptime V: type) type {
                         guard.mark_insert();
                         _ = try leaf.insert_key(logical_pos, k.*, LV.init_value(val));
                         guard.release();
-                        _ = @atomicRmw(usize, &self.count, .Add, 1, .monotonic);
+                        self.shard_count.increment();
                         return null;
                     }
                     guard.mark_insert();
@@ -393,7 +413,7 @@ pub fn MassTree(comptime V: type) type {
                     guard.mark_insert();
                     try self.create_layer(leaf, slot, k, val);
                     guard.release();
-                    _ = @atomicRmw(usize, &self.count, .Add, 1, .monotonic);
+                    self.shard_count.increment();
                     return null;
                 },
                 .layer => |slot| {
@@ -441,8 +461,14 @@ pub fn MassTree(comptime V: type) type {
                 }
 
                 // OCC navigate to leaf (retries automatically on internode changes)
-                const const_leaf = navigate_to_leaf_occ(current_root, current_is_leaf, k) orelse continue;
+                const const_leaf = navigate_to_leaf_occ(current_root, current_is_leaf, k) orelse {
+                    @branchHint(.unlikely);
+                    continue;
+                };
                 var current: *Leaf = @constCast(const_leaf);
+
+                // Prefetch leaf for write before locking
+                pf.prefetch_leaf_write(@ptrCast(current));
 
                 // B-link forward: lock, check boundary, advance if needed.
                 while (true) {
@@ -454,6 +480,7 @@ pub fn MassTree(comptime V: type) type {
                             const first_slot = next_perm.get(0);
                             const boundary_ikey = next_leaf.ikeys[first_slot];
                             if (k.ikey() >= boundary_ikey) {
+                                @branchHint(.unlikely);
                                 guard.release();
                                 current = next_leaf;
                                 continue;
@@ -485,7 +512,7 @@ pub fn MassTree(comptime V: type) type {
                     }
 
                     guard.release();
-                    _ = @atomicRmw(usize, &self.count, .Sub, 1, .monotonic);
+                    self.shard_count.decrement();
                     return old_val;
                 },
                 .layer => |slot| {
@@ -520,6 +547,10 @@ pub fn MassTree(comptime V: type) type {
 
             var inode: *const InternodeNode = @ptrCast(@alignCast(root));
             while (true) {
+                // Prefetch CL1 of internode (ikeys[7..14]) while we
+                // wait for the version to become stable.
+                pf.prefetch_internode_keys(inode);
+
                 const ver = inode.stable();
 
                 // Use atomic nkeys load to avoid reading a partially-updated
@@ -537,15 +568,23 @@ pub fn MassTree(comptime V: type) type {
                 }
                 const child = inode.load_child(child_idx) orelse return null;
 
+                // Prefetch child node while we validate parent version.
+                pf.prefetch_child(child);
+
                 // Validate internode read
-                if (inode.has_changed(ver)) return null;
+                if (inode.has_changed(ver)) {
+                    @branchHint(.unlikely);
+                    return null;
+                }
 
                 if (inode.height == 0) {
                     // Child is a leaf
                     return @ptrCast(@alignCast(child));
                 }
 
-                // Child is an internode — descend
+                // Child is an internode — descend.
+                // Speculatively prefetch grandchild for pipelined descent.
+                pf.prefetch_grandchild(child, InternodeNode);
                 inode = @ptrCast(@alignCast(child));
             }
         }
@@ -717,7 +756,7 @@ pub fn MassTree(comptime V: type) type {
 
             // Release the leaf lock
             guard.release();
-            _ = @atomicRmw(usize, &self.count, .Add, 1, .monotonic);
+            self.shard_count.increment();
             return null;
         }
 

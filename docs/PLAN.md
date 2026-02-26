@@ -192,15 +192,35 @@ and per-node locking for writers.
    passed to individual methods (`deinit(allocator)`, `append(allocator, item)`)
 2. `popOrNull()` renamed to `pop()` (returns `?T`) in Zig 0.15
 
-## Phase 6 — Performance & Polish (~500 lines)
+## Phase 6 — Performance & Polish (~500 lines) ✅
 
-| Component | Description |
-|-----------|-------------|
-| `prefetch.zig` | `@prefetch` for next-node prefetching during descent |
-| `shard_counter.zig` | `align(64)` per-thread counters for approximate `len()` |
-| Branch hints | `@branchHint(.unlikely)` on error/retry paths |
-| Benchmarks | Update `bench/main.zig` for generic API + concurrent benchmarks |
-| Documentation | Update ARCHITECTURE.md and ALGORITHMS.md |
+140/140 tests passing (13 new Phase 6 tests + 127 existing).
+
+| Module | Description | Status |
+|--------|-------------|--------|
+| `prefetch.zig` | `@prefetch` wrappers: internode CL1, child, grandchild, leaf read/write, blink-ahead | ✅ |
+| `shard_counter.zig` | 16×128B-aligned sharded counter, FNV-1a thread mapping, `threadlocal` caching | ✅ |
+| Branch hints | `@branchHint(.unlikely)` on OCC retry, B-link forward, error paths in tree.zig | ✅ |
+| tree.zig integration | Prefetch in `navigate_to_leaf_occ`/`get`/`put`/`remove`; `ShardedCounter` replaces `count` | ✅ |
+| Benchmarks | `bench/main.zig` rewritten: 9 single-threaded + 4 concurrent benchmarks | ✅ |
+| build.zig | Bench step enabled with `createModule` + `addImport` | ✅ |
+| Documentation | ARCHITECTURE.md and ALGORITHMS.md fully rewritten for concurrent architecture | ✅ |
+
+### Key design decisions for Phase 6:
+- **Prefetch comptime gate**: `enable_prefetch = true` allows A/B benchmarking
+  by flipping to `false`. All prefetch functions become no-ops at comptime.
+- **Pointer casting for `@prefetch`**: Zig's `@prefetch` requires `[*]const u8`.
+  Wrapper functions accept `?*const anyopaque` and use `@ptrCast` for ergonomic
+  call sites. Null pointers are silently ignored (no-op).
+- **Sharded counter shard count = 16**: Matches Rust (`NUM_SHARDS = 16`), each
+  shard is `align(128)` to avoid false sharing on platforms with 128-byte cache
+  lines (Apple M-series). Thread-to-shard uses FNV-1a hash with `threadlocal`
+  caching and `@branchHint(.cold)` on the compute path.
+- **`load()` clamps to 0**: Sum of shards can go briefly negative under extreme
+  concurrent decrement; `@max(sum, 0)` prevents underflow.
+- **Concurrent benchmarks**: 4 scenarios (disjoint insert, read-only, mixed ops,
+  hot-key contention) × 4 thread counts (1, 2, 4, 8). Workers use 8-byte
+  big-endian keys for minimal overhead.
 
 ## Estimated Size
 
@@ -211,10 +231,11 @@ and per-node locking for writers.
 | Phase 3 | ~2,000 | ~775 |
 | Phase 4 | ~2,500 | ~1,200 |
 | Phase 5 | ~1,500 | ~957 (new) + ~150 (integration) |
-| Phase 6 | ~500 | — |
-| **Total** | **~12,000** | **~7,764 so far** |
+| Phase 6 | ~500 | ~459 (src) + ~388 (bench) |
+| **Total** | **~12,000** | **~8,223 src + 782 tests + 388 bench** |
 
-Current codebase: 7,764 lines in `src/`, 782 lines in `tests/`, 127/127 tests passing.
+Current codebase: 8,223 lines in `src/`, 782 lines in `tests/`, 388 lines in
+`bench/`, 140/140 tests passing.
 
 (vs ~25,000 lines Rust — Zig is more concise due to comptime generics, no
 trait boilerplate, no unsafe ceremony)

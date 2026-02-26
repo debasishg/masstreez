@@ -5,6 +5,7 @@
 //! ## Phase 3 — Range Scan
 //! ## Phase 4 — Concurrency
 //! ## Phase 5 — Epoch-Based Reclamation
+//! ## Phase 6 — Performance & Polish
 //!
 //! This module re-exports core types and the MassTree API.
 
@@ -30,6 +31,10 @@ pub const range = @import("range.zig");
 pub const ebr = @import("ebr.zig");
 pub const node_pool = @import("node_pool.zig");
 pub const coalesce = @import("coalesce.zig");
+
+// -- Phase 6: Performance & Polish --
+pub const prefetch = @import("prefetch.zig");
+pub const shard_counter = @import("shard_counter.zig");
 
 // -- Convenience re-exports --
 pub const Key = key.Key;

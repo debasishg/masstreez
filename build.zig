@@ -36,6 +36,20 @@ pub fn build(b: *std.Build) void {
     //   tests/layer_tests.zig, tests/tree_tests.zig, tests/integration_tests.zig
 
     // ── Benchmarks ──────────────────────────────────────────────────────
-    // Phase 1: benchmarks disabled until Phase 2 tree operations.
-    // TODO(Phase 2): Re-enable bench/main.zig
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_mod.addImport("masstree", masstree_mod);
+
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = bench_mod,
+    });
+    b.installArtifact(bench_exe);
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run performance benchmarks");
+    bench_step.dependOn(&run_bench.step);
 }
